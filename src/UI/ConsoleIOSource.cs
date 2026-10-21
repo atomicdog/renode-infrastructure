@@ -116,11 +116,16 @@ namespace Antmicro.Renode.UI
 
         private void RedirectedHandling()
         {
-            // For cases in which input has been redirected from a file
-            while(true)
+            // For cases in which input has been redirected from a file.
+            // Console.Read returns -1 immediately and forever at EOF, so forward it once and stop
+            // instead of flooding subscribers (e.g. an unbounded BlockingCollection) with -1.
+            int b;
+            do
             {
-                ByteRead?.Invoke(Console.Read());
+                b = Console.Read();
+                ByteRead?.Invoke(b);
             }
+            while(b != -1);
         }
 
         private void StandardHandling()
