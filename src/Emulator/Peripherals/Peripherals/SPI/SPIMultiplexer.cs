@@ -120,9 +120,11 @@ namespace Antmicro.Renode.Peripherals.SPI
                 {
                     chipSelects.Add(number);
                 }
-                else
+                else if(chipSelects.Remove(number))
                 {
-                    chipSelects.Remove(number);
+                    // Finish only on the selected -> deselected edge.  This runs for
+                    // every input whenever any chip select changes, so finishing all
+                    // inactive devices would repeatedly end transfers on idle slaves.
                     FinishTransmissionByAddress(number);
                 }
             }
