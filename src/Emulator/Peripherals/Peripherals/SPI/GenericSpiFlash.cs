@@ -111,7 +111,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             temporaryConfiguration = 0;
         }
 
-        public void Reset()
+        public virtual void Reset()
         {
             statusRegister.Reset();
             flagStatusRegister.Reset();
