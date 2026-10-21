@@ -18,7 +18,8 @@ namespace Antmicro.Renode.Peripherals.CAN
     /// Freescale/NXP S12 MSCAN controller (as found in MC9S12P128).
     /// Byte-addressable, 64-byte register block at offset 0x0140 from module base.
     /// Implements standard 11-bit CAN with 3 TX buffers, single RX buffer,
-    /// 2-bank acceptance filter, and RX/TX interrupts.
+    /// acceptance filtering in the 32-, 16- and 8-bit modes (with IDHIT),
+    /// and RX/TX interrupts.
     /// </summary>
     public class S12MSCAN : BasicBytePeripheral, IKnownSize, ICAN
     {
@@ -26,7 +27,7 @@ namespace Antmicro.Renode.Peripherals.CAN
         {
             RxIRQ = new GPIO();
             TxIRQ = new GPIO();
-            rxFifo = new Queue<CANMessageFrame>();
+            rxFifo = new Queue<ReceivedFrame>();
             DefineRegisters();
             Reset();
         }
@@ -36,6 +37,8 @@ namespace Antmicro.Renode.Peripherals.CAN
             base.Reset();
             rxFifo.Clear();
             initMode = true;
+            filterMode = 0;
+            idHit = 0;
             txBufFree = 0x07; // all 3 TX buffers free
             txBufSel = 0;
             Array.Clear(rxIdr, 0, rxIdr.Length);
@@ -65,14 +68,14 @@ namespace Antmicro.Renode.Peripherals.CAN
                 return;
             }
 
-            if(!FilterAccepts(message))
+            if(!TryMatchFilter(message, out var hit))
             {
                 this.DebugLog("RX frame ID=0x{0:X} rejected by filter", message.Id);
                 return;
             }
 
-            this.DebugLog("RX frame ID=0x{0:X} DLC={1} accepted", message.Id, message.Data.Length);
-            rxFifo.Enqueue(message);
+            this.DebugLog("RX frame ID=0x{0:X} DLC={1} accepted by filter {2}", message.Id, message.Data.Length, hit);
+            rxFifo.Enqueue(new ReceivedFrame(message, hit));
 
             if((canrflg & RXF) == 0)
             {
@@ -112,7 +115,7 @@ namespace Antmicro.Renode.Peripherals.CAN
             case CANTARQ_OFF: return 0;
             case CANTAAK_OFF: return 0;
             case CANTBSEL_OFF: return txBufSel;
-            case CANIDAC_OFF: return canidac;
+            case CANIDAC_OFF: return (byte)((filterMode << 4) | idHit); // IDAM, IDHIT
             case CANRXERR_OFF: return 0;
             case CANTXERR_OFF: return 0;
 
@@ -188,7 +191,7 @@ namespace Antmicro.Renode.Peripherals.CAN
                 txBufSel = SelectLowestBit((byte)(value & txBufFree & 0x07));
                 break;
             case CANIDAC_OFF:
-                canidac = value;
+                filterMode = (byte)((value >> 4) & 0x3); // IDHIT is read-only
                 break;
 
             // Acceptance filter registers
@@ -252,7 +255,9 @@ namespace Antmicro.Renode.Peripherals.CAN
                 return;
             }
 
-            var frame = rxFifo.Dequeue();
+            var received = rxFifo.Dequeue();
+            var frame = received.Frame;
+            idHit = received.FilterHit;
             uint id = frame.Id;
             int dlc = Math.Min(frame.Data.Length, 8);
 
@@ -270,50 +275,57 @@ namespace Antmicro.Renode.Peripherals.CAN
             UpdateInterrupts();
         }
 
-        private bool FilterAccepts(CANMessageFrame message)
+        // Acceptance filtering of a standard frame (IDR0 = ID[10:3],
+        // IDR1 = ID[2:0] << 5 with RTR and IDE clear) in the mode CANIDAC.IDAM
+        // selects. A filter matches when every bit its mask (IDMR) leaves
+        // clear equals the acceptance code (IDAR). For standard identifiers:
+        //   00: two 32-bit filters, IDAR0-1/IDAR4-5 against IDR0-1
+        //   01: four 16-bit filters, IDAR(2k)-(2k+1) against IDR0-1
+        //   10: eight 8-bit filters, IDARk against IDR0
+        //   11: closed, nothing is accepted
+        // The number of the first matching filter becomes IDHIT.
+        private bool TryMatchFilter(CANMessageFrame message, out int hit)
         {
-            // Two 32-bit acceptance filter banks (2x16-bit in MSCAN)
-            // IDAC[5:4] selects filter mode: 00=two 32-bit, 01=four 16-bit, 10=eight 8-bit, 11=closed
-            // For simplicity, implement the common "two 32-bit" mode
-            // Filter: (rx_id & ~mask) == (acceptance & ~mask)
-            uint rxId = message.Id;
+            var rxIdr0 = (byte)(message.Id >> 3);
+            var rxIdr1 = (byte)((message.Id & 0x07) << 5);
 
-            // Bank 0: IDAR0-3 / IDMR0-3
-            if(FilterBankAccepts(rxId, 0))
+            switch(filterMode)
             {
-                return true;
+            case 0:
+                for(hit = 0; hit < 2; hit++)
+                {
+                    if(FilterMatches(rxIdr0, hit * 4) && FilterMatches(rxIdr1, hit * 4 + 1))
+                    {
+                        return true;
+                    }
+                }
+                break;
+            case 1:
+                for(hit = 0; hit < 4; hit++)
+                {
+                    if(FilterMatches(rxIdr0, hit * 2) && FilterMatches(rxIdr1, hit * 2 + 1))
+                    {
+                        return true;
+                    }
+                }
+                break;
+            case 2:
+                for(hit = 0; hit < 8; hit++)
+                {
+                    if(FilterMatches(rxIdr0, hit))
+                    {
+                        return true;
+                    }
+                }
+                break;
             }
-
-            // Bank 1: IDAR4-7 / IDMR4-7
-            if(FilterBankAccepts(rxId, 4))
-            {
-                return true;
-            }
-
+            hit = 0;
             return false;
         }
 
-        private bool FilterBankAccepts(uint rxId, int bankOffset)
+        private bool FilterMatches(byte idr, int filterRegister)
         {
-            // Standard ID: IDR0 = ID[10:3], IDR1[7:5] = ID[2:0]
-            // Acceptance: IDAR[0] matched against IDR0, IDAR[1] against IDR1, etc.
-            byte accIdr0 = idar[bankOffset];
-            byte mskIdr0 = idmr[bankOffset];
-            byte accIdr1 = idar[bankOffset + 1];
-            byte mskIdr1 = idmr[bankOffset + 1];
-
-            byte rxIdr0 = (byte)(rxId >> 3);
-            byte rxIdr1 = (byte)((rxId & 0x07) << 5);
-
-            if((rxIdr0 & ~mskIdr0) != (accIdr0 & ~mskIdr0))
-            {
-                return false;
-            }
-            if((rxIdr1 & ~mskIdr1) != (accIdr1 & ~mskIdr1))
-            {
-                return false;
-            }
-            return true;
+            return ((idr ^ idar[filterRegister]) & ~idmr[filterRegister]) == 0;
         }
 
         // 0x10-0x13 IDAR0-3, 0x14-0x17 IDMR0-3, 0x18-0x1B IDAR4-7, 0x1C-0x1F IDMR4-7
@@ -370,7 +382,8 @@ namespace Antmicro.Renode.Peripherals.CAN
         private byte txBufFree; // CANTFLG: bit per free buffer
         private byte cantier;
         private byte txBufSel; // CANTBSEL: selected TX buffer
-        private byte canidac;
+        private byte filterMode; // CANIDAC.IDAM
+        private byte idHit;      // CANIDAC.IDHIT of the frame in the RX buffer
 
         private readonly byte[] rxIdr = new byte[4];
         private readonly byte[] rxDsr = new byte[8];
@@ -384,7 +397,19 @@ namespace Antmicro.Renode.Peripherals.CAN
         private readonly byte[] idar = new byte[8]; // acceptance registers (2 banks of 4)
         private readonly byte[] idmr = new byte[8]; // mask registers (2 banks of 4)
 
-        private readonly Queue<CANMessageFrame> rxFifo;
+        private readonly Queue<ReceivedFrame> rxFifo;
+
+        private struct ReceivedFrame
+        {
+            public ReceivedFrame(CANMessageFrame frame, int filterHit)
+            {
+                Frame = frame;
+                FilterHit = (byte)filterHit;
+            }
+
+            public CANMessageFrame Frame { get; }
+            public byte FilterHit { get; }
+        }
 
         // Register offsets (relative to module base, 0x0140 on MC9S12P128)
         private const long CANCTL0_OFF  = 0x00;
