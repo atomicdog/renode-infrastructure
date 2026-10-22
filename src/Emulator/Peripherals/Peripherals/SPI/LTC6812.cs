@@ -208,6 +208,25 @@ namespace Antmicro.Renode.Peripherals.SPI
             SetCellVoltage(cell, (ushort)(millivolts * 10), device);
         }
 
+        public int GetCellMillivolts(int cell, int device = 0)
+        {
+            if(device < 0 || device >= numberOfDevices)
+            {
+                this.Log(LogLevel.Warning, "Invalid device {0}, must be 0-{1}", device, numberOfDevices - 1);
+                return 0;
+            }
+            if(cell < 1 || cell > NumberOfCells)
+            {
+                this.Log(LogLevel.Warning, "Invalid cell number {0}, must be 1-{1}", cell, NumberOfCells);
+                return 0;
+            }
+            return cellVoltages[device * NumberOfCells + cell - 1] / 10;
+        }
+
+        public int NumberOfDevices => numberOfDevices;
+
+        public int CellsPerDevice => NumberOfCells;
+
         public void SetAllCellMillivolts(int millivolts)
         {
             for(int d = 0; d < numberOfDevices; d++)
