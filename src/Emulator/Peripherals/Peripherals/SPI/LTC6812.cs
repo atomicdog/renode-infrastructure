@@ -126,10 +126,6 @@ namespace Antmicro.Renode.Peripherals.SPI
                     }
                     return 0xFF;
 
-                case State.StcommClocks:
-                    // Trailing clock pulses after STCOMM — discard until CS deasserts
-                    return 0xFF;
-
                 case State.SendingResponse:
                     // Master is clocking out a byte but we already queued the response
                     // This shouldn't normally happen (response queue was empty)
@@ -257,18 +253,10 @@ namespace Antmicro.Renode.Peripherals.SPI
             switch(cc)
             {
                 case 0x001: // WRCFGA
-                    state = State.ReceivingData;
-                    writeByteIndex = 0;
-                    writeTotalBytes = numberOfDevices * 8;
-                    writeBuffer = new byte[writeTotalBytes];
-                    currentWriteTarget = WriteTarget.ConfigA;
+                    StartWrite(WriteTarget.ConfigA);
                     break;
                 case 0x024: // WRCFGB
-                    state = State.ReceivingData;
-                    writeByteIndex = 0;
-                    writeTotalBytes = numberOfDevices * 8;
-                    writeBuffer = new byte[writeTotalBytes];
-                    currentWriteTarget = WriteTarget.ConfigB;
+                    StartWrite(WriteTarget.ConfigB);
                     break;
                 case 0x002: // RDCFGA
                     for(int dev = 0; dev < numberOfDevices; dev++)
@@ -338,18 +326,16 @@ namespace Antmicro.Renode.Peripherals.SPI
                     state = State.Idle;
                     break;
                 case 0x721: // WRCOMM — write the I2C/SPI COMM registers
-                    currentWriteTarget = WriteTarget.Comm;
-                    writeTotalBytes = numberOfDevices * 8;
-                    writeBuffer = new byte[writeTotalBytes];
-                    state = State.ReceivingData;
+                    StartWrite(WriteTarget.Comm);
                     break;
                 case 0x723: // STCOMM — clock the COMM registers out on the I2C port
                     // The master follows STCOMM with extra clock pulses (up to 72 SCK)
-                    // to drive the I2C lines.  Execute the queued I2C transaction now,
-                    // then swallow those trailing clock bytes until CS deasserts so the
-                    // next command stays byte-aligned.
+                    // to drive the I2C lines.  Execute the queued I2C transaction now.
+                    // The trailing clock bytes then slide through the command window
+                    // like wake-up padding until the next command's PEC locks on, so
+                    // no chip-select deassert is needed to resynchronise.
                     ExecuteCommI2C();
-                    state = State.StcommClocks;
+                    state = State.Idle;
                     break;
                 case 0x722: // RDCOMM — read back the COMM registers
                     for(int dev = 0; dev < numberOfDevices; dev++)
@@ -376,6 +362,16 @@ namespace Antmicro.Renode.Peripherals.SPI
                     state = State.Idle;
                     break;
             }
+        }
+
+        // A write command is followed by 6 data bytes + 2 PEC bytes per IC in the chain.
+        private void StartWrite(WriteTarget target)
+        {
+            currentWriteTarget = target;
+            writeByteIndex = 0;
+            writeTotalBytes = numberOfDevices * 8;
+            writeBuffer = new byte[writeTotalBytes];
+            state = State.ReceivingData;
         }
 
         private void ProcessWriteData()
@@ -760,7 +756,6 @@ namespace Antmicro.Renode.Peripherals.SPI
             ReceivingCommand,
             ReceivingData,
             SendingResponse,
-            StcommClocks,
         }
 
         private enum WriteTarget
