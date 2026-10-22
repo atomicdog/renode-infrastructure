@@ -394,7 +394,6 @@ namespace Antmicro.Renode.Peripherals.CAN
                         {
                             nodeRegisters[nodeIndex].Control = (uint)value;
                             this.NoisyLog("Node{0} NCR: 0x{1:X8}", nodeIndex, value);
-                            UpdateInterruptLines();
                         });
 
                 // NSR @ nodeBase + 0x04: Node Status Register
@@ -410,7 +409,6 @@ namespace Antmicro.Renode.Peripherals.CAN
                             nodeRegisters[nodeIndex].Status &= ~w1cBits;
                             // Bits 0-2 (LEC) are directly writable
                             nodeRegisters[nodeIndex].Status = (nodeRegisters[nodeIndex].Status & ~0x7u) | (val & 0x7u);
-                            UpdateInterruptLines();
                         });
 
                 // NIPR @ nodeBase + 0x08: Node Interrupt Pointer Register
@@ -534,7 +532,6 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 case 0x00: // MOFCR
                     mo.FunctionControl = value;
-                    UpdateInterruptLines();
                     break;
                 case 0x04: // MOFGPR
                     mo.FifoGatewayPointer = value;
@@ -592,10 +589,6 @@ namespace Antmicro.Renode.Peripherals.CAN
                 this.DebugLog("MO{0}: TXRQ set, initiating transmit", moIndex);
                 HandleTransmit(moIndex);
             }
-
-            // Re-evaluate interrupt lines after status flag changes.
-            // When firmware clears RXPND/TXPND, the corresponding line de-asserts.
-            UpdateInterruptLines();
         }
 
         private void HandleTransmit(int moIndex)
@@ -678,8 +671,7 @@ namespace Antmicro.Renode.Peripherals.CAN
                 messagePending[txinp] |= (1u << (int)mpn);
             }
 
-            // Re-evaluate all interrupt lines (level-sensitive model)
-            UpdateInterruptLines();
+            PulseEventLines((mo.FunctionControl & MofcrTxie) != 0, txinp, listNum - 1);
 
             // Create the CAN frame
             var frame = new CANMessageFrame(canId, data, extendedFormat: ide);
@@ -935,83 +927,27 @@ namespace Antmicro.Renode.Peripherals.CAN
                 messagePending[rxinp] |= (1u << (int)mpn);
             }
 
-            // Re-evaluate all interrupt lines (level-sensitive model).
-            // Lines stay asserted while any MO has a pending+enabled condition.
-            UpdateInterruptLines();
+            PulseEventLines((mo.FunctionControl & MofcrRxie) != 0, rxinp, listNum - 1);
         }
 
-        /// <summary>
-        /// Level-sensitive interrupt line evaluation.
-        /// Scans all MOs and node status registers to compute the correct
-        /// state of each SRN output line. Lines stay asserted as long as
-        /// any pending+enabled condition exists, matching real XMC4500 hardware.
-        /// </summary>
-        private void UpdateInterruptLines()
+        // MultiCAN service requests are pulses: an RX or TX event pulses the
+        // message object's INP line when RXIE/TXIE is set, and the node's
+        // transfer line (TRINP) when NCR.TRIE is set.  The pending flags
+        // (RXPND, TXPND, NSR.RXOK/TXOK) do not hold a line asserted, so a
+        // handler that returns without clearing them is not re-entered.
+        private void PulseEventLines(bool messageObjectEnabled, uint messageObjectLine, int nodeIndex)
         {
-            var lineState = new bool[NumberOfInterruptLines];
-
-            // MO-level interrupt conditions
-            for(int i = 0; i < NumberOfMessageObjects; i++)
+            if(messageObjectEnabled && messageObjectLine < NumberOfInterruptLines)
             {
-                var mo = messageObjects[i];
-
-                // RX pending with RX interrupt enabled (RXIE = MOFCR bit 16)
-                if((mo.StatusFlags & StatusRxPnd) != 0
-                    && (mo.FunctionControl & (1u << 16)) != 0)
-                {
-                    uint rxinp = mo.InterruptPointer & 0x7u;
-                    if(rxinp < NumberOfInterruptLines)
-                    {
-                        lineState[rxinp] = true;
-                    }
-                }
-
-                // TX pending with TX interrupt enabled (TXIE = MOFCR bit 17)
-                if((mo.StatusFlags & StatusTxPnd) != 0
-                    && (mo.FunctionControl & (1u << 17)) != 0)
-                {
-                    uint txinp = (mo.InterruptPointer >> 4) & 0x7u;
-                    if(txinp < NumberOfInterruptLines)
-                    {
-                        lineState[txinp] = true;
-                    }
-                }
+                Connections[(int)messageObjectLine].Blink();
             }
-
-            // Node-level interrupt conditions
-            for(int n = 0; n < NumberOfNodes; n++)
+            if(nodeIndex >= 0 && nodeIndex < NumberOfNodes && (nodeRegisters[nodeIndex].Control & NcrTrie) != 0)
             {
-                var node = nodeRegisters[n];
-
-                // Transfer interrupt: TRIE enabled and (TXOK or RXOK) set
-                if((node.Control & NcrTrie) != 0
-                    && (node.Status & (NsrTxOk | NsrRxOk)) != 0)
+                var transferLine = nodeRegisters[nodeIndex].InterruptPointer & 0x7u;
+                if(transferLine < NumberOfInterruptLines)
                 {
-                    uint trinp = node.InterruptPointer & 0x7u;
-                    if(trinp < NumberOfInterruptLines)
-                    {
-                        lineState[trinp] = true;
-                    }
+                    Connections[(int)transferLine].Blink();
                 }
-
-                // Alert interrupt: ALIE enabled and ALERT set
-                if((node.Control & NcrAlie) != 0
-                    && (node.Status & NsrAlert) != 0)
-                {
-                    uint alinp = (node.InterruptPointer >> 4) & 0x7u;
-                    if(alinp < NumberOfInterruptLines)
-                    {
-                        lineState[alinp] = true;
-                    }
-                }
-            }
-
-            // Apply computed state to GPIO outputs.
-            // GPIO.Set is a no-op when the value hasn't changed,
-            // so only actual transitions reach the NVIC.
-            for(int i = 0; i < NumberOfInterruptLines; i++)
-            {
-                Connections[i].Set(lineState[i]);
             }
         }
 
@@ -1257,6 +1193,10 @@ namespace Antmicro.Renode.Peripherals.CAN
         private const uint StatusTxRq   = 1u << 8;
         private const uint StatusRxEn   = 1u << 7;
         private const uint StatusDir    = 1u << 11;
+
+        // MOFCR bit definitions
+        private const uint MofcrRxie = 1u << 16;
+        private const uint MofcrTxie = 1u << 17;
 
         // NCR bit definitions
         private const uint NcrInit  = 1u << 0;
