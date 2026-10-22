@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.SPI;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
@@ -25,10 +26,16 @@ namespace Antmicro.Renode.Peripherals.SPI
     // commands return the result registers, which hold 0xFFFF after reset
     // or a CLRCELL/CLRAUX and take the inputs only when a conversion
     // command (ADCV, ADAX, ADCVAX, ...) measures that channel.
+    //
+    // A conversion takes the datasheet's total conversion time for its command,
+    // channel selection and ADC mode (MD bits, with IC0's ADCOPT).  The results
+    // are latched when the command arrives; the time only shows in PLADC: after
+    // it, SDO reads low (0x00) until the conversion ends and high (0xFF) after.
     public class LTC6812 : ISPIPeripheral, IGPIOReceiver
     {
-        public LTC6812(int numberOfDevices = 1)
+        public LTC6812(IMachine machine, int numberOfDevices = 1)
         {
+            this.machine = machine;
             this.numberOfDevices = numberOfDevices;
             cellVoltages = new ushort[numberOfDevices * NumberOfCells];
             gpioVoltages = new ushort[numberOfDevices * NumberOfGpios];
@@ -51,7 +58,8 @@ namespace Antmicro.Renode.Peripherals.SPI
             cmdByteIndex = 0;
             writeByteIndex = 0;
             responseQueue.Clear();
-            adcConversionDone = false;
+            conversionEnd = TimeInterval.Empty;
+            polling = false;
             Array.Clear(configA, 0, configA.Length);
             Array.Clear(configB, 0, configB.Length);
             Array.Clear(commReg, 0, commReg.Length);
@@ -95,6 +103,8 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 case State.Idle:
                 case State.ReceivingCommand:
+                    // After PLADC, SDO is low while a conversion is running
+                    var output = polling && Now < conversionEnd ? (byte)0x00 : (byte)0xFF;
                     state = State.ReceivingCommand;
                     // The LTC isoSPI has no chip-select frame, and the driver prefixes
                     // transactions with wake-up pad bytes, so a fixed 4-byte boundary
@@ -116,7 +126,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                         // If this was a read command, state is now SendingResponse
                         // If write, state is ReceivingData; poll/action, back to Idle
                     }
-                    return 0xFF;
+                    return output;
 
                 case State.ReceivingData:
                     writeBuffer[writeByteIndex++] = data;
@@ -143,6 +153,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             cmdByteIndex = 0;
             writeByteIndex = 0;
             responseQueue.Clear();
+            polling = false;
         }
 
         public void OnGPIO(int number, bool value)
@@ -251,6 +262,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
             this.Log(LogLevel.Debug, "Command: CC=0x{0:X3} (CMD0=0x{1:X2} CMD1=0x{2:X2})", cc, cmd0, cmd1);
 
+            polling = false;
             switch(cc)
             {
                 case 0x001: // WRCFGA
@@ -322,8 +334,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                     state = State.Idle;
                     break;
                 case 0x714: // PLADC
-                    // Poll: return SDO high when done (we're always done instantly)
-                    adcConversionDone = true;
+                    polling = true;
                     state = State.Idle;
                     break;
                 case 0x721: // WRCOMM — write the I2C/SPI COMM registers
@@ -351,10 +362,10 @@ namespace Antmicro.Renode.Peripherals.SPI
                     // ADC conversion commands (ADCV, ADAX, ADSTAT, etc.)
                     if((cc & 0x600) != 0)
                     {
-                        // Start ADC — conversion is instant in emulation
                         ConvertChannels(cc);
-                        adcConversionDone = true;
-                        this.Log(LogLevel.Debug, "ADC conversion started (instant), CC=0x{0:X3}", cc);
+                        var micros = ConversionMicroseconds(cc);
+                        conversionEnd = Now + TimeInterval.FromMicroseconds(micros);
+                        this.Log(LogLevel.Debug, "ADC conversion started, CC=0x{0:X3}, {1} us", cc, micros);
                     }
                     else
                     {
@@ -473,6 +484,73 @@ namespace Antmicro.Renode.Peripherals.SPI
         private byte ReadCommI2CByte(int index)
         {
             return index < commI2CReadData.Count ? commI2CReadData[index] : (byte)0xFF;
+        }
+
+        // Total conversion time of a conversion command, from the datasheet's
+        // conversion time tables (Tables 5-12 and Table 37).  Commands whose
+        // time is not listed (DIAGN, invalid selections) take none.
+        private ulong ConversionMicroseconds(int cc)
+        {
+            var code = cc & ~0x180;
+            uint[] times = null;
+            if(code == 0x467 || code == 0x477) // ADCVSC
+            {
+                times = CellsAndSumTimes;
+            }
+            else if(code == 0x46F || code == 0x47F) // ADCVAX
+            {
+                times = CellsAndGpio12Times;
+            }
+            else if((code & ~0x017) == 0x260 || (code & ~0x057) == 0x228) // ADCV, ADOW
+            {
+                var ch = code & 0x7;
+                times = ch == 0 ? AllCellsTimes : (ch <= 5 ? OneChannelPerAdcTimes : null);
+            }
+            else if((code & ~0x060) == 0x207) // CVST
+            {
+                times = AllCellsTimes;
+            }
+            else if((code & ~0x010) == 0x201) // ADOL
+            {
+                times = OverlapTimes;
+            }
+            else if((code & ~0x060) == 0x407) // AXST
+            {
+                times = AllAuxTimes;
+            }
+            else if((code & ~0x060) == 0x40F) // STATST
+            {
+                times = AllStatusTimes;
+            }
+            else if((code & ~0x007) == 0x460 || (code & ~0x007) == 0x400 || (code & ~0x047) == 0x410) // ADAX, ADAXD, AXOW
+            {
+                var chg = code & 0x7;
+                times = chg == 0 ? AllAuxTimes : (chg <= 4 ? TwoAuxTimes : (chg <= 6 ? OneChannelTimes : null));
+            }
+            else if((code & ~0x007) == 0x468 || (code & ~0x007) == 0x408) // ADSTAT, ADSTATD
+            {
+                var chst = code & 0x7;
+                times = chst == 0 ? AllStatusTimes : (chst <= 4 ? OneChannelTimes : null);
+            }
+            return times == null ? 0 : times[AdcModeIndex(cc)];
+        }
+
+        // Column of the conversion time tables: 27kHz, 14kHz, 7kHz, 3kHz, 2kHz,
+        // 1kHz, 422Hz, 26Hz.  MD picks the mode, ADCOPT (CFGAR0[0]) its variant.
+        private int AdcModeIndex(int cc)
+        {
+            var adcopt = (configA[0] & 0x1) != 0;
+            switch((cc >> 7) & 0x3)
+            {
+                case 1:
+                    return adcopt ? 1 : 0;
+                case 2:
+                    return adcopt ? 3 : 2;
+                case 3:
+                    return adcopt ? 4 : 7;
+                default:
+                    return adcopt ? 5 : 6;
+            }
         }
 
         // Latch the analog inputs into the result registers for the channels a
@@ -738,6 +816,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         private const ushort Ref2VoltageRaw = 30000; // 3.0V second reference
         private const ushort ClearedRegisterValue = 0xFFFF;
 
+        private TimeInterval Now => machine.ElapsedVirtualTime.TimeElapsed;
+
+        private readonly IMachine machine;
         private readonly int numberOfDevices;
         private readonly ushort[] cellVoltages;
         private readonly ushort[] gpioVoltages;
@@ -757,7 +838,8 @@ namespace Antmicro.Renode.Peripherals.SPI
         private int writeTotalBytes;
         private State state;
         private WriteTarget currentWriteTarget;
-        private bool adcConversionDone;
+        private TimeInterval conversionEnd;
+        private bool polling;
         private bool i2cReadMode;
         private int i2cRecordIndex;
         private readonly ushort[] sumOfCells;
@@ -765,6 +847,18 @@ namespace Antmicro.Renode.Peripherals.SPI
         private ushort analogSupply;
         private ushort digitalSupply;
         private byte revisionCode;
+
+        // Total conversion times in us, in the column order of AdcModeIndex
+        private static readonly uint[] AllCellsTimes = { 937, 1083, 1956, 2537, 3701, 6028, 10683, 167774 };
+        private static readonly uint[] OneChannelPerAdcTimes = { 203, 232, 407, 523, 756, 1221, 2152, 33570 };
+        private static readonly uint[] CellsAndSumTimes = { 1147, 1322, 2369, 3067, 4463, 7256, 12842, 201351 };
+        private static readonly uint[] CellsAndGpio12Times = { 1328, 1531, 2753, 3568, 5197, 8455, 14971, 234899 };
+        private static readonly uint[] OverlapTimes = { 384, 442, 791, 1024, 1490, 2420, 4282, 67119 };
+        private static readonly uint[] AllAuxTimes = { 1825, 2116, 3862, 5025, 7353, 12007, 21316, 335498 };
+        private static readonly uint[] AllStatusTimes = { 742, 858, 1556, 2022, 2953, 4814, 8538, 134211 };
+        // Table 37 gives these two rounded
+        private static readonly uint[] TwoAuxTimes = { 380, 439, 788, 1000, 1500, 2400, 4300, 67100 };
+        private static readonly uint[] OneChannelTimes = { 200, 229, 403, 520, 753, 1200, 2100, 34000 };
 
         private enum State
         {
