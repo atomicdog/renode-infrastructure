@@ -22,10 +22,17 @@ namespace Antmicro.Renode.Peripherals.Analog
         // peripheralClockFrequency is fADC (= fPERIPH). When set, a background
         // scan takes the conversion time the programmed input classes give
         // its channels; when 0 it takes a fixed ScanDelayMicroseconds.
-        public XMC4XXX_VADC(IMachine machine, long peripheralClockFrequency = 0)
+        // referenceMillivolts is VAREF, the full scale of a 12-bit conversion,
+        // used by SetChannelMillivolts.
+        public XMC4XXX_VADC(IMachine machine, long peripheralClockFrequency = 0, int referenceMillivolts = 3300)
         {
+            if(referenceMillivolts <= 0)
+            {
+                throw new Antmicro.Renode.Exceptions.ConstructionException($"{nameof(referenceMillivolts)} must be positive, got {referenceMillivolts}");
+            }
             this.machine = machine;
             this.peripheralClockFrequency = peripheralClockFrequency;
+            this.referenceMillivolts = referenceMillivolts;
 
             var innerConnections = new Dictionary<int, IGPIO>();
             for(int i = 0; i < NumberOfServiceRequestNodes; i++)
@@ -145,6 +152,39 @@ namespace Antmicro.Renode.Peripherals.Analog
         }
 
         /// <summary>
+        /// Drive an analog input with a raw 12-bit conversion result.  Each background
+        /// scan that converts the channel (BRSSEL) stores it in the result register its
+        /// CHCTR.RESREG selects, or the global result register when CHCTR.RESTBS is set.
+        /// Channels never driven leave their result registers to SetResultValue.
+        /// Kept across Reset, like the rest of the board's analog inputs.
+        /// Callable from the monitor: vadc SetChannelValue 0 1 3521
+        /// </summary>
+        public void SetChannelValue(int group, int channel, ushort value)
+        {
+            if(group < 0 || group >= NumberOfGroups)
+            {
+                throw new Antmicro.Renode.Exceptions.RecoverableException(
+                    $"Invalid group {group}, must be 0-{NumberOfGroups - 1}");
+            }
+            if(channel < 0 || channel >= ChannelsPerGroup)
+            {
+                throw new Antmicro.Renode.Exceptions.RecoverableException(
+                    $"Invalid channel {channel}, must be 0-{ChannelsPerGroup - 1}");
+            }
+            channelInputs[group, channel] = Math.Min((int)value, MaxResult);
+            this.Log(LogLevel.Info, "G{0}CH{1} input = {2} (0x{2:X3})", group, channel, channelInputs[group, channel]);
+        }
+
+        /// <summary>
+        /// Drive an analog input with a voltage, converted against VAREF (referenceMillivolts).
+        /// </summary>
+        public void SetChannelMillivolts(int group, int channel, int millivolts)
+        {
+            var code = (int)Math.Round((double)millivolts * (MaxResult + 1) / referenceMillivolts);
+            SetChannelValue(group, channel, (ushort)Math.Max(0, Math.Min(MaxResult, code)));
+        }
+
+        /// <summary>
         /// Set a default raw value for ALL result registers across all groups.
         /// Useful for initializing a baseline voltage on all channels.
         /// </summary>
@@ -192,6 +232,7 @@ namespace Antmicro.Renode.Peripherals.Analog
             machine.ScheduleAction(scanTime, _ =>
             {
                 scanActive = false;
+                LatchChannelInputs();
 
                 // Clear LDEV (bit 9) — scan complete
                 backgroundScanMode &= ~(1u << 9);
@@ -215,6 +256,34 @@ namespace Antmicro.Renode.Peripherals.Analog
                     StartBackgroundScan();
                 }
             });
+        }
+
+        // Store the driven inputs of the channels this background scan converted.
+        // Results are 12-bit, right-aligned (CHCTR.RESPOS and data reduction are
+        // not modelled).
+        private void LatchChannelInputs()
+        {
+            for(int g = 0; g < NumberOfGroups; g++)
+            {
+                var select = registers.Read(BackgroundSelectOffset + g * 4);
+                for(int ch = 0; ch < ChannelsPerGroup; ch++)
+                {
+                    var input = channelInputs[g, ch];
+                    if(input < 0 || (select & (1u << ch)) == 0)
+                    {
+                        continue;
+                    }
+                    var chctr = groups[g].ChannelControl[ch];
+                    if((chctr & ChctrResultToGlobal) != 0)
+                    {
+                        globalResultValue = (uint)input;
+                    }
+                    else
+                    {
+                        groups[g].ResultValues[(chctr >> 16) & 0xFu] = (ushort)input;
+                    }
+                }
+            }
         }
 
         // Duration of one background scan, from the conversion timing in the
@@ -518,6 +587,9 @@ namespace Antmicro.Renode.Peripherals.Analog
         private bool scanActive;
         private TimeInterval lastScanTime;
         private readonly long peripheralClockFrequency;
+        private readonly int referenceMillivolts;
+        // -1: not driven
+        private readonly int[,] channelInputs = CreateUndrivenInputs();
 
         private readonly IMachine machine;
         private readonly VadcGroup[] groups;
@@ -543,7 +615,22 @@ namespace Antmicro.Renode.Peripherals.Analog
         private const uint BrsmrEnsi = 1u << 3;
         private const uint BrsmrScan = 1u << 4;
         private const uint BrsmrLdev = 1u << 9;
+        private const uint ChctrResultToGlobal = 1u << 20; // CHCTR.RESTBS
+        private const int MaxResult = 4095;
         private static readonly uint[] ArbitrationRoundSlots = { 4, 8, 16, 20 };
+
+        private static int[,] CreateUndrivenInputs()
+        {
+            var inputs = new int[NumberOfGroups, ChannelsPerGroup];
+            for(int g = 0; g < NumberOfGroups; g++)
+            {
+                for(int ch = 0; ch < ChannelsPerGroup; ch++)
+                {
+                    inputs[g, ch] = -1;
+                }
+            }
+            return inputs;
+        }
 
         private class VadcGroup
         {
