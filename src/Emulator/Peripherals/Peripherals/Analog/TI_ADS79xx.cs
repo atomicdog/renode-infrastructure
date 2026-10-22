@@ -5,6 +5,8 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
@@ -21,11 +23,16 @@ namespace Antmicro.Renode.Peripherals.Analog
     // DI04 was set), DO11-0 the conversion result, MSB-aligned.  The channel
     // selected in frame n is sampled at the start of frame n+1 and output in frame
     // n+2.  Manual, Auto-1 and Auto-2 modes and their program registers are
-    // modelled; the GPIO program register is accepted and ignored.
+    // modelled.
+    //
+    // GPIO0-3 are outputs 0-3: the GPIO program register's DI03-00 make a pin an
+    // output, and a mode-control frame with DI11 set drives the output pins from
+    // its DI03-00.  Inputs read low; the pins' alarm, range and power-down
+    // functions are not modelled.
     //
     // Frames are delimited by the active-low chip select on GPIO 0 when it is
     // connected, and otherwise by counting two bytes per frame.
-    public class TI_ADS79xx : ISPIPeripheral, IGPIOReceiver
+    public class TI_ADS79xx : ISPIPeripheral, IGPIOReceiver, INumberedGPIOOutput
     {
         public TI_ADS79xx(int numberOfChannels = 12, int resolutionBits = 12, int referenceMillivolts = 2500)
         {
@@ -45,6 +52,12 @@ namespace Antmicro.Renode.Peripherals.Analog
             this.resolutionBits = resolutionBits;
             this.referenceMillivolts = referenceMillivolts;
             channelMillivolts = new int[numberOfChannels];
+            var gpios = new Dictionary<int, IGPIO>();
+            for(var i = 0; i < NumberOfGpios; i++)
+            {
+                gpios[i] = new GPIO();
+            }
+            Connections = new ReadOnlyDictionary<int, IGPIO>(gpios);
             Reset();
         }
 
@@ -63,6 +76,9 @@ namespace Antmicro.Renode.Peripherals.Analog
             outputWord = 0;
             command = 0;
             byteIndex = 0;
+            gpioDirections = 0;
+            gpioLevels = 0;
+            UpdateGpioOutputs();
         }
 
         public byte Transmit(byte data)
@@ -129,6 +145,8 @@ namespace Antmicro.Renode.Peripherals.Analog
             return channelMillivolts[channel];
         }
 
+        public IReadOnlyDictionary<int, IGPIO> Connections { get; }
+
         // At the start of a frame the device outputs the conversion sampled at the
         // start of the previous frame, then samples the channel selected for this one.
         private void StartFrame()
@@ -146,7 +164,7 @@ namespace Antmicro.Renode.Peripherals.Analog
                     channel = manualChannel;
                     break;
             }
-            sampledWord = (ushort)(((gpioOnOutput ? 0 : channel) << 12) | Convert(channel));
+            sampledWord = (ushort)(((gpioOnOutput ? gpioLevels & gpioDirections : channel) << 12) | Convert(channel));
         }
 
         private void ProcessCommand(ushort word)
@@ -190,8 +208,10 @@ namespace Antmicro.Renode.Peripherals.Analog
                     }
                     mode = Mode.Auto2;
                     break;
-                case 0x4: // GPIO program register: pin directions and alarms, not modelled
-                    this.Log(LogLevel.Debug, "GPIO program register 0x{0:X4} ignored", word);
+                case 0x4: // GPIO program register: DI03-00 pin directions (1 = output)
+                    gpioDirections = word & GpioMask;
+                    this.Log(LogLevel.Debug, "GPIO directions set to 0x{0:X}", gpioDirections);
+                    UpdateGpioOutputs();
                     return;
                 case 0x8:
                     expectingAuto1Mask = true;
@@ -208,10 +228,20 @@ namespace Antmicro.Renode.Peripherals.Analog
             {
                 doubleRange = (word & RangeBit) != 0;
                 gpioOnOutput = (word & GpioOnOutputBit) != 0;
+                gpioLevels = word & GpioMask;
+                UpdateGpioOutputs();
                 if((word & PowerDownBit) != 0)
                 {
                     this.Log(LogLevel.Debug, "Power-down requested, conversions continue");
                 }
+            }
+        }
+
+        private void UpdateGpioOutputs()
+        {
+            for(var i = 0; i < NumberOfGpios; i++)
+            {
+                Connections[i].Set((gpioDirections & gpioLevels & (1 << i)) != 0);
             }
         }
 
@@ -271,6 +301,8 @@ namespace Antmicro.Renode.Peripherals.Analog
         private ushort outputWord;
         private ushort command;
         private int byteIndex;
+        private int gpioDirections;
+        private int gpioLevels;
 
         private readonly int numberOfChannels;
         private readonly int resolutionBits;
@@ -282,6 +314,8 @@ namespace Antmicro.Renode.Peripherals.Analog
         private const int RangeBit = 1 << 6;
         private const int PowerDownBit = 1 << 5;
         private const int GpioOnOutputBit = 1 << 4;
+        private const int GpioMask = 0xF;
+        private const int NumberOfGpios = 4;
 
         private enum Mode
         {
