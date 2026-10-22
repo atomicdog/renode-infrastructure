@@ -35,6 +35,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             cellRegisters = new ushort[numberOfDevices * NumberOfCells];
             gpioRegisters = new ushort[numberOfDevices * NumberOfGpios];
             ref2Registers = new ushort[numberOfDevices];
+            sumOfCells = new ushort[numberOfDevices];
             configA = new byte[numberOfDevices * 6];
             configB = new byte[numberOfDevices * 6];
             commReg = new byte[numberOfDevices * 6];
@@ -415,7 +416,10 @@ namespace Antmicro.Renode.Peripherals.SPI
         // Decode the COMM registers as an I2C transaction with the COMM I2C slave.
         // Each IC's 6 COMM bytes hold three comm slots: [ICOM(4b) | D(8b) | FCOM(4b)].
         // ICOM 0x6=START, 0x0=BLANK(data), 0x1=STOP, 0x7=NO-TRANSMIT.  On a read the
-        // slave byte is written back into the D field so RDCOMM returns it.
+        // slave byte is written back into the D field so RDCOMM returns it.  A byte
+        // the master sends (the START control byte, or data in a write) reads back
+        // FCOM 0111 when the slave ACKs it and 1111 when it NACKs (datasheet read
+        // codes); the slave is present when it has read data configured.
         private void ExecuteCommI2C()
         {
             for(int dev = 0; dev < numberOfDevices; dev++)
@@ -434,6 +438,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                             i2cReadMode = (data & 1) != 0;
                             i2cRecordIndex = 0;
                             this.Log(LogLevel.Debug, "COMM I2C START dev{0} addr=0x{1:X2} {2}", dev, data >> 1, i2cReadMode ? "R" : "W");
+                            SetSlaveAcknowledge(hi);
                             break;
                         case 0x0: // BLANK: a data byte
                             if(i2cReadMode)
@@ -444,7 +449,11 @@ namespace Antmicro.Renode.Peripherals.SPI
                                 commReg[hi] = (byte)((b0 & 0xF0) | (val >> 4));
                                 commReg[hi + 1] = (byte)(((val & 0xF) << 4) | (b1 & 0xF));
                             }
-                            // write byte (e.g. a memory address) — ignored
+                            else
+                            {
+                                // write byte (e.g. a memory address) — not stored
+                                SetSlaveAcknowledge(hi);
+                            }
                             break;
                         case 0x1: // STOP
                         case 0x7: // NO TRANSMIT — slot unused
@@ -453,6 +462,12 @@ namespace Antmicro.Renode.Peripherals.SPI
                     }
                 }
             }
+        }
+
+        private void SetSlaveAcknowledge(int slotIndex)
+        {
+            var fcom = commI2CReadData.Count > 0 ? 0x7 : 0xF;
+            commReg[slotIndex + 1] = (byte)((commReg[slotIndex + 1] & 0xF0) | fcom);
         }
 
         private byte ReadCommI2CByte(int index)
@@ -632,8 +647,8 @@ namespace Antmicro.Renode.Peripherals.SPI
             for(int dev = 0; dev < numberOfDevices; dev++)
             {
                 var data = new byte[6];
-                data[0] = (byte)(sumOfCells & 0xFF);
-                data[1] = (byte)(sumOfCells >> 8);
+                data[0] = (byte)(sumOfCells[dev] & 0xFF);
+                data[1] = (byte)(sumOfCells[dev] >> 8);
                 data[2] = (byte)(internalTemp & 0xFF);
                 data[3] = (byte)(internalTemp >> 8);
                 data[4] = (byte)(analogSupply & 0xFF);
@@ -659,18 +674,19 @@ namespace Antmicro.Renode.Peripherals.SPI
             state = State.SendingResponse;
         }
 
+        // SC (status register group A) is each IC's own sum of cells at
+        // 100µV * 30 per LSB (LTC6812/6813; the 12-cell LTC6811 uses * 20).
         private void UpdateSumOfCells()
         {
-            uint sum = 0;
-            for(int i = 0; i < NumberOfCells; i++)
+            for(int dev = 0; dev < numberOfDevices; dev++)
             {
-                sum += cellVoltages[i];
+                uint sum = 0;
+                for(int i = 0; i < NumberOfCells; i++)
+                {
+                    sum += cellVoltages[dev * NumberOfCells + i];
+                }
+                sumOfCells[dev] = (ushort)(sum / 30);
             }
-            // SC register = sum * 20 * 100µV / 30 / 100µV = sum * 2 / 3
-            // Actually per datasheet: SC = 16-bit value, total measured voltage
-            // with 20 * 100µV/LSB resolution. SC = (C1+...+C15) / 20
-            // But simplified: just store the sum divided by some factor
-            sumOfCells = (ushort)(sum / 20);
         }
 
         // PEC-15 calculation per LTC6812 datasheet
@@ -744,7 +760,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private bool adcConversionDone;
         private bool i2cReadMode;
         private int i2cRecordIndex;
-        private ushort sumOfCells;
+        private readonly ushort[] sumOfCells;
         private ushort internalTemp;
         private ushort analogSupply;
         private ushort digitalSupply;
