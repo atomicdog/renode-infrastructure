@@ -13,6 +13,7 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Peripherals.SPI;
 using Antmicro.Renode.Time;
@@ -26,6 +27,14 @@ namespace Antmicro.Renode.Peripherals.UART
         // divider runs from. When set, SPI master words take the time the
         // programmed FDR/BRG/SCTR/PCR settings give them; when 0 they are
         // instant.
+        //
+        // By default a timed word completes asynchronously, with the receive
+        // event when it has been shifted out, while the CPU runs on. With
+        // SpiTimingStallsCpu the CPU spends the word's time in the TBUF write
+        // instead and the word completes when it ends. Firmware that starts a
+        // byte, then blocks on a completion its receive ISR never yields to,
+        // relies on its code path outlasting the wire; the emulated CPU is too
+        // fast for that, and each byte would wait for the next scheduler tick.
         public XMC4XXX_UART(IMachine machine, long peripheralClockFrequency = 0) : base(machine)
         {
             this.machine = machine;
@@ -59,6 +68,8 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             return registers.Read(offset);
         }
+
+        public bool SpiTimingStallsCpu { get; set; }
 
         public void WriteDoubleWord(long offset, uint val)
         {
@@ -272,7 +283,16 @@ namespace Antmicro.Renode.Peripherals.UART
                     CompleteSpiWord(response);
                     return;
                 }
-                if(machine.SystemBus.TryGetCurrentCPU(out var cpu))
+                var onCpu = machine.SystemBus.TryGetCurrentCPU(out var cpu);
+                if(SpiTimingStallsCpu && onCpu && cpu is BaseCPU baseCpu)
+                {
+                    // Whole instruction slots, so the skip is exact
+                    var cycles = (ulong)Math.Ceiling(wordTime.TotalMicroseconds * baseCpu.PerformanceInMips);
+                    baseCpu.SkipTime(TimeInterval.FromCPUCycles(cycles, baseCpu.PerformanceInMips, out var _));
+                    CompleteSpiWord(response);
+                    return;
+                }
+                if(onCpu)
                 {
                     cpu.SyncTime();
                 }
