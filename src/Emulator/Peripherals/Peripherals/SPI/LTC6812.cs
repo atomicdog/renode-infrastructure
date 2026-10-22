@@ -20,6 +20,11 @@ namespace Antmicro.Renode.Peripherals.SPI
     // Supports daisy chain emulation: set numberOfDevices > 1 to model
     // multiple ICs sharing one isoSPI bus.  Cell voltages for each IC
     // are set via SetCellVoltage(device, cell, value).
+    //
+    // The values set from the monitor are the analog inputs.  The read
+    // commands return the result registers, which hold 0xFFFF after reset
+    // or a CLRCELL/CLRAUX and take the inputs only when a conversion
+    // command (ADCV, ADAX, ADCVAX, ...) measures that channel.
     public class LTC6812 : ISPIPeripheral, IGPIOReceiver
     {
         public LTC6812(int numberOfDevices = 1)
@@ -27,6 +32,9 @@ namespace Antmicro.Renode.Peripherals.SPI
             this.numberOfDevices = numberOfDevices;
             cellVoltages = new ushort[numberOfDevices * NumberOfCells];
             gpioVoltages = new ushort[numberOfDevices * NumberOfGpios];
+            cellRegisters = new ushort[numberOfDevices * NumberOfCells];
+            gpioRegisters = new ushort[numberOfDevices * NumberOfGpios];
+            ref2Registers = new ushort[numberOfDevices];
             configA = new byte[numberOfDevices * 6];
             configB = new byte[numberOfDevices * 6];
             commReg = new byte[numberOfDevices * 6];
@@ -56,6 +64,8 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
             // Default GPIO: 0V
             Array.Clear(gpioVoltages, 0, gpioVoltages.Length);
+            ClearCellRegisters();
+            ClearAuxRegisters();
             // Default internal die temp: ~25°C
             // ITMP = measured_value / 100µV/LSB, T(°C) = ITMP * 100µV / 7.6mV/°C - 276°C
             // For 25°C: (25+276) * 7.6mV / 100µV = 301 * 76 = 22876 = 0x595C
@@ -205,6 +215,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             if(device < 0 || device >= numberOfDevices)
             {
+                this.Log(LogLevel.Warning, "Invalid device {0}, must be 0-{1}", device, numberOfDevices - 1);
                 return;
             }
             if(gpio < 1 || gpio > NumberOfGpios)
@@ -213,6 +224,12 @@ namespace Antmicro.Renode.Peripherals.SPI
                 return;
             }
             gpioVoltages[device * NumberOfGpios + gpio - 1] = rawValue;
+            this.Log(LogLevel.Info, "IC{0} GPIO{1} voltage set to {2} ({3:F4}V)", device, gpio, rawValue, rawValue * 0.0001);
+        }
+
+        public void SetGpioMillivolts(int gpio, int millivolts, int device = 0)
+        {
+            SetGpioVoltage(gpio, (ushort)(millivolts * 10), device);
         }
 
         private void ProcessCommand()
@@ -305,11 +322,11 @@ namespace Antmicro.Renode.Peripherals.SPI
                     QueueStatusB();
                     break;
                 case 0x711: // CLRCELL
-                    for(int i = 0; i < NumberOfCells; i++) cellVoltages[i] = 0xFFFF;
+                    ClearCellRegisters();
                     state = State.Idle;
                     break;
                 case 0x712: // CLRAUX
-                    for(int i = 0; i < NumberOfGpios; i++) gpioVoltages[i] = 0xFFFF;
+                    ClearAuxRegisters();
                     state = State.Idle;
                     break;
                 case 0x713: // CLRSTAT
@@ -348,6 +365,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                     if((cc & 0x600) != 0)
                     {
                         // Start ADC — conversion is instant in emulation
+                        ConvertChannels(cc);
                         adcConversionDone = true;
                         this.Log(LogLevel.Debug, "ADC conversion started (instant), CC=0x{0:X3}", cc);
                     }
@@ -446,6 +464,99 @@ namespace Antmicro.Renode.Peripherals.SPI
             return index < commI2CReadData.Count ? commI2CReadData[index] : (byte)0xFF;
         }
 
+        // Latch the analog inputs into the result registers for the channels a
+        // conversion command measures.  The MD (speed) bits only change timing.
+        private void ConvertChannels(int cc)
+        {
+            var code = cc & ~0x180;
+            if((code & ~0x017) == 0x260 || (code & ~0x057) == 0x228) // ADCV, ADOW: CH selects cells
+            {
+                ConvertCells(code & 0x7);
+            }
+            else if(code == 0x467 || code == 0x477) // ADCVSC: all cells + sum of cells
+            {
+                ConvertCells(0);
+            }
+            else if(code == 0x46F || code == 0x47F) // ADCVAX: all cells + GPIO1, GPIO2
+            {
+                ConvertCells(0);
+                for(int dev = 0; dev < numberOfDevices; dev++)
+                {
+                    ConvertGpio(dev, 1);
+                    ConvertGpio(dev, 2);
+                }
+            }
+            else if((code >= 0x460 && code <= 0x466) || (code >= 0x400 && code <= 0x406)) // ADAX, ADAXD: CHG selects
+            {
+                ConvertAux(code & 0x7);
+            }
+        }
+
+        // CH = 0: all cells; CH = n (1-5): cells n, n+5 and n+10.
+        private void ConvertCells(int ch)
+        {
+            if(ch > 5)
+            {
+                return;
+            }
+            for(int dev = 0; dev < numberOfDevices; dev++)
+            {
+                for(int cell = 1; cell <= NumberOfCells; cell++)
+                {
+                    if(ch == 0 || (cell - 1) % 5 == ch - 1)
+                    {
+                        var i = dev * NumberOfCells + cell - 1;
+                        cellRegisters[i] = cellVoltages[i];
+                    }
+                }
+            }
+        }
+
+        // CHG = 0: GPIO1-9 and REF2; 1-4: GPIOn and GPIOn+5; 5: GPIO5; 6: REF2.
+        private void ConvertAux(int chg)
+        {
+            for(int dev = 0; dev < numberOfDevices; dev++)
+            {
+                for(int gpio = 1; gpio <= NumberOfGpios; gpio++)
+                {
+                    if(chg == 0 || (chg <= 5 && (gpio == chg || gpio == chg + 5)))
+                    {
+                        ConvertGpio(dev, gpio);
+                    }
+                }
+                if(chg == 0 || chg == 6)
+                {
+                    ref2Registers[dev] = Ref2VoltageRaw;
+                }
+            }
+        }
+
+        private void ConvertGpio(int device, int gpio)
+        {
+            var i = device * NumberOfGpios + gpio - 1;
+            gpioRegisters[i] = gpioVoltages[i];
+        }
+
+        private void ClearCellRegisters()
+        {
+            for(int i = 0; i < cellRegisters.Length; i++)
+            {
+                cellRegisters[i] = ClearedRegisterValue;
+            }
+        }
+
+        private void ClearAuxRegisters()
+        {
+            for(int i = 0; i < gpioRegisters.Length; i++)
+            {
+                gpioRegisters[i] = ClearedRegisterValue;
+            }
+            for(int i = 0; i < ref2Registers.Length; i++)
+            {
+                ref2Registers[i] = ClearedRegisterValue;
+            }
+        }
+
         private void QueueReadResponseSingle(byte[] data)
         {
             // Queue 6 data bytes + 2 PEC bytes for one IC
@@ -466,7 +577,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 for(int i = 0; i < 3; i++)
                 {
                     var cellIdx = dev * NumberOfCells + startCell + i;
-                    var voltage = cellIdx < cellVoltages.Length ? cellVoltages[cellIdx] : (ushort)0;
+                    var voltage = cellIdx < cellRegisters.Length ? cellRegisters[cellIdx] : (ushort)0;
                     data[i * 2] = (byte)(voltage & 0xFF);
                     data[i * 2 + 1] = (byte)(voltage >> 8);
                 }
@@ -483,7 +594,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 for(int i = 0; i < 3; i++)
                 {
                     var gpioIdx = dev * NumberOfGpios + startGpio + i;
-                    var voltage = gpioIdx < gpioVoltages.Length ? gpioVoltages[gpioIdx] : (ushort)0;
+                    var voltage = gpioIdx < gpioRegisters.Length ? gpioRegisters[gpioIdx] : (ushort)0;
                     data[i * 2] = (byte)(voltage & 0xFF);
                     data[i * 2 + 1] = (byte)(voltage >> 8);
                 }
@@ -497,9 +608,9 @@ namespace Antmicro.Renode.Peripherals.SPI
             for(int dev = 0; dev < numberOfDevices; dev++)
             {
                 var data = new byte[6];
-                var g4 = dev * NumberOfGpios + 3 < gpioVoltages.Length ? gpioVoltages[dev * NumberOfGpios + 3] : (ushort)0;
-                var g5 = dev * NumberOfGpios + 4 < gpioVoltages.Length ? gpioVoltages[dev * NumberOfGpios + 4] : (ushort)0;
-                ushort ref2 = 30000;
+                var g4 = gpioRegisters[dev * NumberOfGpios + 3];
+                var g5 = gpioRegisters[dev * NumberOfGpios + 4];
+                var ref2 = ref2Registers[dev];
                 data[0] = (byte)(g4 & 0xFF); data[1] = (byte)(g4 >> 8);
                 data[2] = (byte)(g5 & 0xFF); data[3] = (byte)(g5 >> 8);
                 data[4] = (byte)(ref2 & 0xFF); data[5] = (byte)(ref2 >> 8);
@@ -513,7 +624,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             for(int dev = 0; dev < numberOfDevices; dev++)
             {
                 var data = new byte[6];
-                var g9 = dev * NumberOfGpios + 8 < gpioVoltages.Length ? gpioVoltages[dev * NumberOfGpios + 8] : (ushort)0;
+                var g9 = gpioRegisters[dev * NumberOfGpios + 8];
                 data[0] = (byte)(g9 & 0xFF); data[1] = (byte)(g9 >> 8);
                 QueueReadResponseSingle(data);
             }
@@ -612,10 +723,15 @@ namespace Antmicro.Renode.Peripherals.SPI
         private const int NumberOfCells = 15;
         private const int NumberOfGpios = 9;
         private const ushort DefaultCellVoltageRaw = 36000; // 3.6V at 100µV/LSB
+        private const ushort Ref2VoltageRaw = 30000; // 3.0V second reference
+        private const ushort ClearedRegisterValue = 0xFFFF;
 
         private readonly int numberOfDevices;
         private readonly ushort[] cellVoltages;
         private readonly ushort[] gpioVoltages;
+        private readonly ushort[] cellRegisters;
+        private readonly ushort[] gpioRegisters;
+        private readonly ushort[] ref2Registers;
         private readonly byte[] configA;
         private readonly byte[] configB;
         private readonly byte[] commReg;
