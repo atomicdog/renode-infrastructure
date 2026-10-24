@@ -4,12 +4,15 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -72,6 +75,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         public long Size => 0x1000;
+
+        // The RTC's calendar, "yyyy-MM-dd HH:mm:ss". The RTC is in the hibernate
+        // domain: it keeps its time and its enable across a system reset. Setting it
+        // also starts it, as on a board whose RTC was already running.
+        public string RtcTime
+        {
+            get
+            {
+                var now = RtcNow();
+                return string.Format("{0:D4}-{1:MM-dd HH:mm:ss}", now.Year - RtcYearOffset, now);
+            }
+            set
+            {
+                var parsed = DateTime.ParseExact(value, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                rtcEnabled = true;
+                RebaseRtc(parsed.AddYears(RtcYearOffset));
+            }
+        }
 
         public DoubleWordRegisterCollection RegistersCollection { get; }
 
@@ -844,10 +865,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // CTR @ 0xA04 — RTC Control (mirror register)
             map.Add(0xA04, new DoubleWordRegister(this)
-                .WithFlag(0, name: "ENB")  // RTC enable
+                .WithFlag(0, name: "ENB",  // RTC enable
+                    valueProviderCallback: _ => rtcEnabled,
+                    writeCallback: (_, value) =>
+                    {
+                        if(value != rtcEnabled)
+                        {
+                            var now = RtcNow();
+                            rtcEnabled = value;
+                            RebaseRtc(now);
+                        }
+                    })
                 .WithFlag(1, name: "TAE")  // Timer alarm enable
                 .WithReservedBits(2, 14)
-                .WithTag("DIV", 16, 16)
+                .WithValueField(16, 16, name: "DIV",
+                    valueProviderCallback: _ => rtcDivider,
+                    writeCallback: (_, value) =>
+                    {
+                        var now = RtcNow();
+                        rtcDivider = (uint)value;
+                        RebaseRtc(now);
+                    })
                 .WithWriteCallback((_, __) => SignalMirrorWriteComplete(SrrawRtcCtr))
             );
 
@@ -885,45 +923,71 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     writeCallback: (_, __) => SignalMirrorWriteComplete(SrrawRtcAtim1))
             );
 
-            // TIM0 @ 0xA20 — RTC Time Register 0 (seconds, minutes, hours, days)
-            // The seconds field increments based on elapsed virtual time so that
-            // timeout loops in XMC library functions (e.g. XMC_SCU_RESET_DeassertPeripheralReset)
-            // see time progressing and don't spin forever.
+            // TIM0 @ 0xA20 — RTC Time Register 0: seconds, minutes, hours and
+            // days (day of month - 1). The RTC counts one second per (DIV + 1)
+            // periods of its 32.768 kHz clock while CTR.ENB is set; a write sets
+            // the fields it holds.
             map.Add(0xA20, new DoubleWordRegister(this)
-                .WithValueField(0, 6, FieldMode.Read, name: "SE",
-                    valueProviderCallback: _ =>
-                    {
-                        // Return virtual time seconds. Increment rtcReadCount so
-                        // that timeout loops see time advancing even when virtual
-                        // time hasn't ticked a full second yet.
-                        var secs = (ulong)machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds;
-                        rtcReadCount++;
-                        return (secs + rtcReadCount / 4) % 60;
-                    })
+                .WithValueField(0, 6, name: "SE", valueProviderCallback: _ => (ulong)RtcNow().Second)
                 .WithReservedBits(6, 2)
-                .WithValueField(8, 6, FieldMode.Read, name: "MI",
-                    valueProviderCallback: _ =>
-                        ((ulong)machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds / 60) % 60)
+                .WithValueField(8, 6, name: "MI", valueProviderCallback: _ => (ulong)RtcNow().Minute)
                 .WithReservedBits(14, 2)
-                .WithValueField(16, 5, FieldMode.Read, name: "HO",
-                    valueProviderCallback: _ =>
-                        ((ulong)machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds / 3600) % 24)
+                .WithValueField(16, 5, name: "HO", valueProviderCallback: _ => (ulong)RtcNow().Hour)
                 .WithReservedBits(21, 3)
-                .WithValueField(24, 5, FieldMode.Read, name: "DA",
-                    valueProviderCallback: _ => 1)   // day 1 (1-based)
+                .WithValueField(24, 5, name: "DA", valueProviderCallback: _ => (ulong)RtcNow().Day - 1)
                 .WithReservedBits(29, 3)
-                .WithWriteCallback((_, __) => SignalMirrorWriteComplete(SrrawRtcTim0))
+                .WithWriteCallback((_, value) =>
+                {
+                    var now = RtcNow();
+                    SetRtcFields(now.Year, now.Month, (int)((value >> 24) & 0x1F) + 1,
+                        (int)((value >> 16) & 0x1F), (int)((value >> 8) & 0x3F), (int)(value & 0x3F));
+                    SignalMirrorWriteComplete(SrrawRtcTim0);
+                })
             );
 
-            // TIM1 @ 0xA24 — RTC Time Register 1 (day of week, month, year)
-            map.Add(0xA24, new DoubleWordRegister(this, 0x00000001u)  // month=1
-                .WithValueField(0, 3, FieldMode.Read, name: "DAWE")  // day of week
+            // TIM1 @ 0xA24 — RTC Time Register 1: day of week, month - 1, year
+            map.Add(0xA24, new DoubleWordRegister(this)
+                .WithValueField(0, 3, name: "DAWE", valueProviderCallback: _ => (ulong)(int)RtcNow().DayOfWeek)
                 .WithReservedBits(3, 5)
-                .WithValueField(8, 4, FieldMode.Read, valueProviderCallback: _ => 1, name: "MO")  // month (1=Jan)
+                .WithValueField(8, 4, name: "MO", valueProviderCallback: _ => (ulong)RtcNow().Month - 1)
                 .WithReservedBits(12, 4)
-                .WithValueField(16, 16, FieldMode.Read, name: "YE")  // year
-                .WithWriteCallback((_, __) => SignalMirrorWriteComplete(SrrawRtcTim1))
+                .WithValueField(16, 16, name: "YE", valueProviderCallback: _ => (ulong)(RtcNow().Year - RtcYearOffset))
+                .WithWriteCallback((_, value) =>
+                {
+                    var now = RtcNow();
+                    SetRtcFields((int)(value >> 16) + RtcYearOffset, (int)((value >> 8) & 0xF) + 1, now.Day,
+                        now.Hour, now.Minute, now.Second);
+                    SignalMirrorWriteComplete(SrrawRtcTim1);
+                })
             );
+        }
+
+        // The calendar is kept as a DateTime whose year is the RTC's YE plus
+        // RtcYearOffset, so the reset value (year 0) has a DateTime too.
+        private DateTime RtcNow()
+        {
+            if(!rtcEnabled)
+            {
+                return rtcBase;
+            }
+            var elapsed = machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds - rtcBaseVirtualSeconds;
+            var secondsPerTick = (rtcDivider + 1) / 32768.0;
+            return rtcBase.AddSeconds(Math.Floor(elapsed / secondsPerTick));
+        }
+
+        private void RebaseRtc(DateTime calendar)
+        {
+            rtcBase = calendar;
+            rtcBaseVirtualSeconds = machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds;
+        }
+
+        private void SetRtcFields(int year, int month, int day, int hour, int minute, int second)
+        {
+            // Out-of-range fields are clamped, so a partly written calendar stays valid
+            year = Math.Min(year, DateTime.MaxValue.Year);
+            month = Math.Max(1, Math.Min(12, month));
+            day = Math.Max(1, Math.Min(DateTime.DaysInMonth(year, month), day));
+            RebaseRtc(new DateTime(year, month, day, Math.Min(hour, 23), Math.Min(minute, 59), Math.Min(second, 59)));
         }
 
         private readonly IMachine machine;
@@ -970,7 +1034,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong cgatstat3;
 
         // RTC read counter — ensures timeout loops see time advancing
-        private ulong rtcReadCount;
+        // RTC (hibernate domain): not reset by Reset()
+        private bool rtcEnabled;
+        private uint rtcDivider = 0x7FFF;
+        private DateTime rtcBase = new DateTime(RtcYearOffset, 1, 1);
+        private double rtcBaseVirtualSeconds;
+
+        private const int RtcYearOffset = 2000;
 
         // System clock control fields
         private IValueRegisterField sysclkDiv;
