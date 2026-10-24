@@ -183,16 +183,6 @@ namespace Antmicro.Renode.Peripherals.UART
                 }
             }
 
-            if(transmitBufferInterruptEnable.Value)
-            {
-                // TX buffer is always ready (instant transmit) — fire TBINP while enabled
-                var node = (int)txBufferInterruptNode.Value;
-                if(node < NumberOfInterruptNodes)
-                {
-                    nodeState[node] = true;
-                }
-            }
-
             // FIFO mode: TX buffer event (STBI) → STBINP node.
             if(txFifoSize.Value > 0 && stbiFlag && activeMode)
             {
@@ -223,6 +213,28 @@ namespace Antmicro.Renode.Peripherals.UART
                     irqs[i].Set(nodeState[i]);
                     irqLastState[i] = nodeState[i];
                 }
+            }
+        }
+
+        // The transmit buffer event: TBUF's word has moved into the shifter.
+        // It sets PSR.TBIF and, with CCR.TBIEN, pulses the TBINP node. It is an
+        // event, not a level: enabling TBIEN with TBUF empty raises nothing.
+        private void TransmitBufferEvent()
+        {
+            transmitBufferIndicationFlag.Value = true;
+            if(transmitBufferInterruptEnable.Value)
+            {
+                PulseServiceRequest((int)txBufferInterruptNode.Value);
+            }
+        }
+
+        // A service request pulse on node SRx. A node another source already
+        // holds high has its interrupt pending; pulsing it would drop that level.
+        private void PulseServiceRequest(int node)
+        {
+            if(node < NumberOfInterruptNodes && !irqLastState[node])
+            {
+                irqs[node].Blink();
             }
         }
 
@@ -264,7 +276,9 @@ namespace Antmicro.Renode.Peripherals.UART
             return 0;
         }
 
-        private void DoTransmit(byte value)
+        // Returns how long until the word moves from TBUF into the shifter:
+        // Empty when it does so at once.
+        private TimeInterval DoTransmit(byte value)
         {
             if(channelMode.Value == 1 && spiSlaveDevice != null)
             {
@@ -282,7 +296,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 if(wordTime == TimeInterval.Empty)
                 {
                     CompleteSpiWord(response);
-                    return;
+                    return TimeInterval.Empty;
                 }
                 var onCpu = machine.SystemBus.TryGetCurrentCPU(out var cpu);
                 if(onCpu)
@@ -310,7 +324,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     var cycles = (ulong)Math.Ceiling(untilReceived.TotalMicroseconds * baseCpu.PerformanceInMips);
                     baseCpu.SkipTime(TimeInterval.FromCPUCycles(cycles, baseCpu.PerformanceInMips, out var _));
                     CompleteSpiWord(response);
-                    return;
+                    return TimeInterval.Empty;
                 }
                 var generation = spiGeneration;
                 machine.ScheduleAction(untilReceived, _ =>
@@ -320,13 +334,14 @@ namespace Antmicro.Renode.Peripherals.UART
                         CompleteSpiWord(response);
                     }
                 });
+                return start - now;
             }
             else if(channelMode.Value == 1)
             {
                 // SPI mode but no slave device — silently discard.
                 // Do NOT set rxIndicationFlag or fire interrupts, as that
                 // creates a tight TX→IRQ→TX loop on unconnected SPI channels.
-                return;
+                return TimeInterval.Empty;
             }
             else
             {
@@ -341,6 +356,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     value >= 0x20 && value < 0x7F ? (char)value : '.');
                 UpdateInterrupts();
             }
+            return TimeInterval.Empty;
         }
 
         private void CompleteSpiWord(byte response)
@@ -640,7 +656,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithTaggedFlag("RSIF", 10)
                 .WithTaggedFlag("DLIF", 11)
                 .WithTaggedFlag("TSIF", 12)
-                .WithTaggedFlag("TBIF", 13)
+                .WithFlag(13, out transmitBufferIndicationFlag, FieldMode.Read | FieldMode.WriteZeroToClear, name: "TBIF")
                 .WithFlag(14, out rxIndicationFlag, FieldMode.Read | FieldMode.WriteZeroToClear, name: "RIF")
                 .WithTaggedFlag("AIF", 15)
                 .WithTaggedFlag("BRGIF", 16)
@@ -655,6 +671,10 @@ namespace Antmicro.Renode.Peripherals.UART
             map.Add((long)Registers.ProtocolStatusClear, new DoubleWordRegister(this)
                 .WithValueField(0, 32, FieldMode.Write, name: "PSCR", writeCallback: (_, val) =>
                 {
+                    if((val & (1u << 13)) != 0)
+                    {
+                        transmitBufferIndicationFlag.Value = false;
+                    }
                     if((val & (1u << 14)) != 0)
                     {
                         rxIndicationFlag.Value = false;
@@ -690,6 +710,15 @@ namespace Antmicro.Renode.Peripherals.UART
                     {
                         spiCsAsserted = true;
                         this.NoisyLog("FMR: SIO=0x{0:X} — SPI CS asserted", (uint)val);
+                    }
+                    // SIOx activates service request output SRx: firmware uses it
+                    // to start its transmit ISR (DAVE's SPI master does).
+                    for(var node = 0; node < NumberOfInterruptNodes; node++)
+                    {
+                        if((val & (1u << node)) != 0)
+                        {
+                            PulseServiceRequest(node);
+                        }
                     }
                 })
                 .WithReservedBits(22, 10)
@@ -737,7 +766,23 @@ namespace Antmicro.Renode.Peripherals.UART
             for(int i = 0; i < 32; i++)
             {
                 map.Add((long)Registers.TransmitBufferInput + i * 4, new DoubleWordRegister(this)
-                    .WithValueField(0, 16, name: "TDATA", writeCallback: (_, v) => DoTransmit((byte)v))
+                    .WithValueField(0, 16, name: "TDATA", writeCallback: (_, v) =>
+                    {
+                        var untilShifted = DoTransmit((byte)v);
+                        if(untilShifted == TimeInterval.Empty)
+                        {
+                            TransmitBufferEvent();
+                            return;
+                        }
+                        var generation = spiGeneration;
+                        machine.ScheduleAction(untilShifted, __ =>
+                        {
+                            if(generation == spiGeneration)
+                            {
+                                TransmitBufferEvent();
+                            }
+                        });
+                    })
                     .WithReservedBits(16, 16)
                 );
             }
@@ -916,6 +961,7 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private IFlagRegisterField receiveIndicationInterruptEnable;  // CCR.RIEN
         private IFlagRegisterField transmitBufferInterruptEnable;      // CCR.TBIEN
+        private IFlagRegisterField transmitBufferIndicationFlag;       // PSR.TBIF
         private IFlagRegisterField rxIndicationFlag;                    // PSR.RIF
         private IFlagRegisterField stopBits;                            // PCR.STPB
         private IValueRegisterField rxInterruptNode;                    // INPR.RINP
