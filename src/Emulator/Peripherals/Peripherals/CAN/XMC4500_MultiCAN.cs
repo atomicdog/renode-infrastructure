@@ -115,6 +115,8 @@ namespace Antmicro.Renode.Peripherals.CAN
                 pendingTransmits[i].Clear();
                 transmitScheduled[i] = false;
             }
+            // Frames still on the bus belong to the old state: drop them.
+            transmitGeneration++;
 
             // Reset message pending registers
             for(int i = 0; i < NumberOfServiceRequests; i++)
@@ -597,6 +599,7 @@ namespace Antmicro.Renode.Peripherals.CAN
 
             // Gate TX on node INIT bit
             int txListNum = mo.ListNumber;
+            ulong frameEndTicks = 0;
             if(txListNum >= 1 && txListNum <= NumberOfNodes)
             {
                 if((nodeRegisters[txListNum - 1].Control & NcrInit) != 0)
@@ -612,6 +615,9 @@ namespace Antmicro.Renode.Peripherals.CAN
                 {
                     return;
                 }
+                // The frame ends at its end of frame field; the interframe space
+                // after it only keeps the bus busy.
+                frameEndTicks = GetFrameDurationTicks(txListNum - 1, mo) - InterframeSpaceBits * GetBitTimeTicks(txListNum - 1);
             }
 
             // Extract CAN ID and IDE flag from MOAR
@@ -650,6 +656,29 @@ namespace Antmicro.Renode.Peripherals.CAN
                 moIndex, canId, ide, dlc,
                 string.Join(" ", data.Select(b => $"0x{b:X2}")));
 
+            // The frame's contents are copied out of the message object when it
+            // starts; the transmit completes (TXOK, TXPND, the interrupt, and the
+            // frame reaching the other nodes) when it has left the bus.
+            var frame = new CANMessageFrame(canId, data, extendedFormat: ide);
+            if(frameEndTicks == 0)
+            {
+                CompleteTransmit(moIndex, frame);
+                return;
+            }
+            var generation = transmitGeneration;
+            this.GetMachine().ScheduleAction(Time.TimeInterval.FromTicks(frameEndTicks), _ =>
+            {
+                if(generation == transmitGeneration)
+                {
+                    CompleteTransmit(moIndex, frame);
+                }
+            });
+        }
+
+        private void CompleteTransmit(int moIndex, CANMessageFrame frame)
+        {
+            var mo = messageObjects[moIndex];
+
             // Clear TXRQ (bit 8), set TXPND (bit 1)
             mo.StatusFlags &= ~(1u << 8);
             mo.StatusFlags |= (1u << 1);
@@ -672,9 +701,6 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
 
             PulseEventLines((mo.FunctionControl & MofcrTxie) != 0, txinp, listNum - 1);
-
-            // Create the CAN frame
-            var frame = new CANMessageFrame(canId, data, extendedFormat: ide);
 
             int txNodeIndex = listNum - 1;
             FrameSent?.Invoke(frame);
@@ -1170,12 +1196,14 @@ namespace Antmicro.Renode.Peripherals.CAN
         private readonly ulong[] nodeBusyUntilTicks;
         private readonly Queue<int>[] pendingTransmits;
         private readonly bool[] transmitScheduled;
+        private ulong transmitGeneration;
 
         private const uint ModuleId = 0x00B0C000;
         // Used until the firmware programs FDR/NBTR: 500 kbit/s
         private const ulong DefaultBitTimeTicks = 2 * Time.TimeInterval.TicksPerMicrosecond;
         private const uint StandardFrameOverheadBits = 47;
         private const uint ExtendedFrameOverheadBits = 67;
+        private const uint InterframeSpaceBits = 3;
         private const int NumberOfMessageObjects = 64;
         private const int NumberOfNodes = 3;
         private const int NumberOfLists = 8;
