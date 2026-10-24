@@ -290,8 +290,13 @@ namespace Antmicro.Renode.Peripherals.Analog
         // reference manual: tCN = (2 + STC + N + PC) * tADCI + 2 * tADC per
         // channel (fast compare: (2 + STC + 2) * tADCI + 2 * tADC), plus one
         // arbitration round, ARBRND slots of (DIVD + 1) / fADC, to select it.
-        // Each group converts its selected channels (BRSSELx) on its own
-        // converter, so the slowest group sets the scan time.
+        // The scan takes the sum of the conversions of all the channels it
+        // selects (BRSSELx) over all groups. The reference manual does not say
+        // whether groups convert background channels in parallel; on an
+        // XMC4500 scanning 26 channels in four groups at 9.14 us each, the
+        // source event came every 237.6 us (4209/s, measured with exception
+        // trace), the sum. Parallel groups would give the 8-channel group's
+        // 73 us.
         private TimeInterval GetBackgroundScanTime()
         {
             if(peripheralClockFrequency <= 0)
@@ -302,14 +307,13 @@ namespace Antmicro.Renode.Peripherals.Analog
             var globcfg = registers.Read(GlobalConfigOffset);
             var fadci = fadc / Math.Max(2u, (globcfg & 0x1Fu) + 1);
             var slot = (((globcfg >> 20) & 0x3u) + 1) / fadc;
-            double longest = 0;
+            double total = 0;
             for(int g = 0; g < NumberOfGroups; g++)
             {
                 var select = registers.Read(BackgroundSelectOffset + g * 4);
                 var slots = ArbitrationRoundSlots[(groups[g].ArbCfg >> 4) & 0x3u];
                 // GLOBCFG.DPCALx turns post-calibration off for group x.
                 var postCalibration = (globcfg & (1u << (16 + g))) != 0 ? 0 : 2;
-                double groupTime = 0;
                 for(int ch = 0; ch < ChannelsPerGroup; ch++)
                 {
                     if((select & (1u << ch)) == 0)
@@ -337,11 +341,10 @@ namespace Antmicro.Renode.Peripherals.Analog
                             cycles = 2 + stc + 12 + postCalibration;
                             break;
                     }
-                    groupTime += cycles / fadci + 2 / fadc + slots * slot;
+                    total += cycles / fadci + 2 / fadc + slots * slot;
                 }
-                longest = Math.Max(longest, groupTime);
             }
-            return longest > 0 ? TimeInterval.FromSeconds(longest) : TimeInterval.FromMicroseconds(ScanDelayMicroseconds);
+            return total > 0 ? TimeInterval.FromSeconds(total) : TimeInterval.FromMicroseconds(ScanDelayMicroseconds);
         }
 
         private DoubleWordRegisterCollection BuildRegisters()
