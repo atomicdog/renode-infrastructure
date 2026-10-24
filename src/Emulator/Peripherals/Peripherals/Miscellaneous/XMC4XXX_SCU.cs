@@ -62,6 +62,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             clkstat = 0u;
             // Hibernate domain initially off
             hibDomainEnabled = false;
+            // Service requests; the RTC (hibernate domain) keeps its own state
+            srraw = 0;
+            srmsk = 0;
+            UpdateInterrupt();
         }
 
         public uint ReadDoubleWord(long offset)
@@ -75,6 +79,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         public long Size => 0x1000;
+
+        // SCU service request (SCU_0, NVIC IRQ 0): asserted while SRSTAT
+        // (SRRAW & SRMSK) is not zero.
+        public GPIO IRQ { get; } = new GPIO();
 
         // The RTC's calendar, "yyyy-MM-dd HH:mm:ss". The RTC is in the hibernate
         // domain: it keeps its time and its enable across a system reset. Setting it
@@ -251,7 +259,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // SRSTAT @ 0x074 — Service Request Status (SRRAW & SRMSK)
             map.Add(0x074, new DoubleWordRegister(this)
                 .WithValueField(0, 32, FieldMode.Read, name: "SRSTAT",
-                    valueProviderCallback: _ => srraw)  // simplified: same as SRRAW for now
+                    valueProviderCallback: _ => srraw & srmsk)
             );
 
             // SRRAW @ 0x078 — Raw Service Request Status (read-only)
@@ -262,19 +270,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // SRMSK @ 0x07C — Service Request Mask
             map.Add(0x07C, new DoubleWordRegister(this)
-                .WithValueField(0, 32, name: "SRMSK")
+                .WithValueField(0, 32, name: "SRMSK",
+                    valueProviderCallback: _ => srmsk,
+                    writeCallback: (_, val) => { srmsk = val; UpdateInterrupt(); })
             );
 
             // SRCLR @ 0x080 — Service Request Clear (write-1-to-clear SRRAW bits)
             map.Add(0x080, new DoubleWordRegister(this)
                 .WithValueField(0, 32, FieldMode.Write, name: "SRCLR",
-                    writeCallback: (_, val) => srraw &= ~val)
+                    writeCallback: (_, val) => { srraw &= ~val; UpdateInterrupt(); })
             );
 
             // SRSET @ 0x084 — Service Request Set (write-1-to-set SRRAW bits)
             map.Add(0x084, new DoubleWordRegister(this)
                 .WithValueField(0, 32, FieldMode.Write, name: "SRSET",
-                    writeCallback: (_, val) => srraw |= val)
+                    writeCallback: (_, val) => { srraw |= val; UpdateInterrupt(); })
             );
         }
 
@@ -282,6 +292,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void SignalMirrorWriteComplete(ulong eventBit)
         {
             srraw |= eventBit;
+            UpdateInterrupt();
+        }
+
+        private void UpdateInterrupt()
+        {
+            IRQ.Set((srraw & srmsk) != 0);
         }
 
         // ────────────────────────────────────────────
@@ -891,35 +907,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // RAWSTAT @ 0xA08 — RTC Raw Service Request Status
             map.Add(0xA08, new DoubleWordRegister(this)
-                .WithValueField(0, 32, FieldMode.Read, name: "RAWSTAT")
+                .WithValueField(0, 32, FieldMode.Read, name: "RAWSTAT", valueProviderCallback: _ => rtcRawStatus)
             );
 
             // STSSR @ 0xA0C — RTC Service Request Status
             map.Add(0xA0C, new DoubleWordRegister(this)
-                .WithValueField(0, 32, FieldMode.Read, name: "STSSR")
+                .WithValueField(0, 32, FieldMode.Read, name: "STSSR", valueProviderCallback: _ => rtcRawStatus & rtcMask)
             );
 
             // MSKSR @ 0xA10 — RTC Service Request Mask (mirror register)
             map.Add(0xA10, new DoubleWordRegister(this)
                 .WithValueField(0, 32, name: "MSKSR",
-                    writeCallback: (_, __) => SignalMirrorWriteComplete(SrrawRtcMsksr))
+                    valueProviderCallback: _ => rtcMask,
+                    writeCallback: (_, val) => { rtcMask = (uint)val; SignalMirrorWriteComplete(SrrawRtcMsksr); })
             );
 
             // CLRSR @ 0xA14 — RTC Clear Service Request (mirror register)
             map.Add(0xA14, new DoubleWordRegister(this)
                 .WithValueField(0, 32, FieldMode.Write, name: "CLRSR",
-                    writeCallback: (_, __) => SignalMirrorWriteComplete(SrrawRtcClrsr))
+                    writeCallback: (_, val) => { rtcRawStatus &= ~(uint)val; SignalMirrorWriteComplete(SrrawRtcClrsr); })
             );
 
             // ATIM0 @ 0xA18 — RTC Alarm Time Register 0 (mirror register)
             map.Add(0xA18, new DoubleWordRegister(this)
-                .WithValueField(0, 32, name: "ATIM0",
+                .WithValueField(0, 32, name: "ATIM0", valueProviderCallback: _ => rtcAlarm0, changeCallback: (_, val) => rtcAlarm0 = (uint)val,
                     writeCallback: (_, __) => SignalMirrorWriteComplete(SrrawRtcAtim0))
             );
 
             // ATIM1 @ 0xA1C — RTC Alarm Time Register 1 (mirror register)
             map.Add(0xA1C, new DoubleWordRegister(this)
-                .WithValueField(0, 32, name: "ATIM1",
+                .WithValueField(0, 32, name: "ATIM1", valueProviderCallback: _ => rtcAlarm1, changeCallback: (_, val) => rtcAlarm1 = (uint)val,
                     writeCallback: (_, __) => SignalMirrorWriteComplete(SrrawRtcAtim1))
             );
 
@@ -979,6 +996,77 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             rtcBase = calendar;
             rtcBaseVirtualSeconds = machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds;
+            ScheduleRtcTick();
+        }
+
+        // Each RTC second raises the periodic events (seconds, and minutes to
+        // years when they roll over) and the alarm when the time matches
+        // ATIM0/ATIM1 with CTR.TAE set. Their STSSR bits (RAWSTAT & MSKSR) set
+        // SRRAW.PI and SRRAW.AI.
+        private void ScheduleRtcTick()
+        {
+            var generation = ++rtcGeneration;
+            if(!rtcEnabled)
+            {
+                return;
+            }
+            var secondsPerTick = (rtcDivider + 1) / 32768.0;
+            var elapsed = machine.ElapsedVirtualTime.TimeElapsed.TotalSeconds - rtcBaseVirtualSeconds;
+            var next = (Math.Floor(elapsed / secondsPerTick) + 1) * secondsPerTick;
+            var delay = TimeInterval.FromMicroseconds((ulong)Math.Max(1, Math.Ceiling((next - elapsed) * 1e6)));
+            machine.ScheduleAction(delay, _ =>
+            {
+                if(generation != rtcGeneration)
+                {
+                    return;
+                }
+                RtcTick();
+                ScheduleRtcTick();
+            });
+        }
+
+        private void RtcTick()
+        {
+            var now = RtcNow();
+            var events = RtcPeriodicSeconds;
+            if(now.Second == 0)
+            {
+                events |= RtcPeriodicMinutes;
+                if(now.Minute == 0)
+                {
+                    events |= RtcPeriodicHours;
+                    if(now.Hour == 0)
+                    {
+                        events |= RtcPeriodicDays;
+                        if(now.Day == 1)
+                        {
+                            events |= RtcPeriodicMonths;
+                            if(now.Month == 1)
+                            {
+                                events |= RtcPeriodicYears;
+                            }
+                        }
+                    }
+                }
+            }
+            var ctr = RegistersCollection.Read(0xA04);
+            if((ctr & 2) != 0
+                && (rtcAlarm0 & 0x1F1F3F3F) == (((uint)(now.Day - 1) << 24) | ((uint)now.Hour << 16) | ((uint)now.Minute << 8) | (uint)now.Second)
+                && (rtcAlarm1 & 0xFFFF0F00) == (((uint)(now.Year - RtcYearOffset) << 16) | ((uint)(now.Month - 1) << 8)))
+            {
+                events |= RtcAlarm;
+            }
+            rtcRawStatus |= events;
+            var pending = rtcRawStatus & rtcMask;
+            if((pending & RtcPeriodicMask) != 0)
+            {
+                srraw |= SrrawPeriodic;
+            }
+            if((pending & RtcAlarm) != 0)
+            {
+                srraw |= SrrawAlarm;
+            }
+            UpdateInterrupt();
         }
 
         private void SetRtcFields(int year, int month, int day, int hour, int minute, int second)
@@ -1039,6 +1127,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private uint rtcDivider = 0x7FFF;
         private DateTime rtcBase = new DateTime(RtcYearOffset, 1, 1);
         private double rtcBaseVirtualSeconds;
+        private uint rtcRawStatus;
+        private uint rtcMask;
+        private uint rtcAlarm0;
+        private uint rtcAlarm1;
+        private ulong rtcGeneration;
+        private ulong srmsk;
+
+        // RTC RAWSTAT/STSSR/MSKSR bits: periodic seconds, minutes, hours,
+        // days, months, years, and the alarm
+        private const uint RtcPeriodicSeconds = 1u << 0;
+        private const uint RtcPeriodicMinutes = 1u << 1;
+        private const uint RtcPeriodicHours = 1u << 2;
+        private const uint RtcPeriodicDays = 1u << 3;
+        private const uint RtcPeriodicMonths = 1u << 5;
+        private const uint RtcPeriodicYears = 1u << 6;
+        private const uint RtcPeriodicMask = 0x6F;
+        private const uint RtcAlarm = 1u << 8;
+        // SRRAW.PI and SRRAW.AI (bit 0 is PRWARN, the WDT pre-warning)
+        private const ulong SrrawPeriodic = 1uL << 1;
+        private const ulong SrrawAlarm = 1uL << 2;
 
         private const int RtcYearOffset = 2000;
 
