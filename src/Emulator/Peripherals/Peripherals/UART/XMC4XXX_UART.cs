@@ -29,9 +29,10 @@ namespace Antmicro.Renode.Peripherals.UART
         // instant.
         //
         // By default a timed word completes asynchronously, with the receive
-        // event when it has been shifted out, while the CPU runs on. With
-        // SpiTimingStallsCpu the CPU spends the word's time in the TBUF write
-        // instead and the word completes when it ends. Firmware that starts a
+        // event when its last bit has been shifted in, while the CPU runs on.
+        // The trailing and inter-word delays after it only hold off the next
+        // word. With SpiTimingStallsCpu the CPU waits in the TBUF write
+        // instead, until the receive event. Firmware that starts a
         // byte, then blocks on a completion its receive ISR never yields to,
         // relies on its code path outlasting the wire; the emulated CPU is too
         // fast for that, and each byte would wait for the next scheduler tick.
@@ -272,10 +273,10 @@ namespace Antmicro.Renode.Peripherals.UART
                 // once the word has been shifted out.
                 var response = spiSlaveDevice.Transmit(value);
                 this.NoisyLog("SPI TX=0x{0:X2} RX=0x{1:X2}", value, response);
-                var wordTime = GetSpiWordTime();
+                var wordTime = GetSpiWordTime(out var receiveTime);
                 if(wordTime != lastSpiWordTime)
                 {
-                    this.Log(LogLevel.Debug, "SPI word time {0:F2} us", wordTime.TotalMicroseconds);
+                    this.Log(LogLevel.Debug, "SPI word time {0:F2} us, received after {1:F2} us", wordTime.TotalMicroseconds, receiveTime.TotalMicroseconds);
                     lastSpiWordTime = wordTime;
                 }
                 if(wordTime == TimeInterval.Empty)
@@ -284,14 +285,6 @@ namespace Antmicro.Renode.Peripherals.UART
                     return;
                 }
                 var onCpu = machine.SystemBus.TryGetCurrentCPU(out var cpu);
-                if(SpiTimingStallsCpu && onCpu && cpu is BaseCPU baseCpu)
-                {
-                    // Whole instruction slots, so the skip is exact
-                    var cycles = (ulong)Math.Ceiling(wordTime.TotalMicroseconds * baseCpu.PerformanceInMips);
-                    baseCpu.SkipTime(TimeInterval.FromCPUCycles(cycles, baseCpu.PerformanceInMips, out var _));
-                    CompleteSpiWord(response);
-                    return;
-                }
                 if(onCpu)
                 {
                     cpu.SyncTime();
@@ -300,9 +293,27 @@ namespace Antmicro.Renode.Peripherals.UART
                 // is free. Measured on the clock source ScheduleAction counts
                 // its delay from.
                 var now = machine.ClockSource.CurrentValue;
-                spiBusyUntil = (spiBusyUntil > now ? spiBusyUntil : now) + wordTime;
+                var stall = SpiTimingStallsCpu && onCpu && cpu is BaseCPU;
+                var baseCpu = cpu as BaseCPU;
+                if(stall)
+                {
+                    // An earlier stall the CPU has not served yet is still
+                    // ahead of it: the CPU's own time includes it.
+                    now += TimeInterval.FromCPUCycles(baseCpu.SkipInstructions, baseCpu.PerformanceInMips, out var _);
+                }
+                var start = spiBusyUntil > now ? spiBusyUntil : now;
+                spiBusyUntil = start + wordTime;
+                var untilReceived = start + receiveTime - now;
+                if(stall)
+                {
+                    // Whole instruction slots, so the skip is exact
+                    var cycles = (ulong)Math.Ceiling(untilReceived.TotalMicroseconds * baseCpu.PerformanceInMips);
+                    baseCpu.SkipTime(TimeInterval.FromCPUCycles(cycles, baseCpu.PerformanceInMips, out var _));
+                    CompleteSpiWord(response);
+                    return;
+                }
                 var generation = spiGeneration;
-                machine.ScheduleAction(spiBusyUntil - now, _ =>
+                machine.ScheduleAction(untilReceived, _ =>
                 {
                     if(generation == spiGeneration)
                     {
@@ -352,9 +363,14 @@ namespace Antmicro.Renode.Peripherals.UART
         //   (BRG.PCTQ + 1) * (BRG.DCTQ + 1) periods of the BRG.CTQSEL clock.
         // Longer frames get their leading/trailing delays only on the first
         // and last word on hardware; that is not modelled.
+        // receiveTime is when the receive event comes: after the leading delay
+        // and the bits. On an XMC4500 MBB (1 MHz SCLK, 2 us delays) the
+        // receive ISR started ~10.5 us after the TBUF write, not the 14 us of
+        // the whole word.
         // Empty when the timing is unknown, which keeps the transfer instant.
-        private TimeInterval GetSpiWordTime()
+        private TimeInterval GetSpiWordTime(out TimeInterval receiveTime)
         {
+            receiveTime = TimeInterval.Empty;
             if(peripheralClockFrequency <= 0 || clockSelect.Value != 0)
             {
                 return TimeInterval.Empty;
@@ -381,11 +397,14 @@ namespace Antmicro.Renode.Peripherals.UART
             var seconds = (wordLength.Value + 1) / fsclk;
 
             var pcr = protocolControl.Value;
+            double frameDelay = 0;
             if((pcr & 1u) != 0 && frameLength.Value <= wordLength.Value)
             {
                 var ftq = TimeQuantumClock(timeQuantumSelect.Value, fpdiv, fppp, fsclk);
-                seconds += 2.0 * (frameDelayPrescaler.Value + 1) * (frameDelayCount.Value + 1) / ftq;
+                frameDelay = (frameDelayPrescaler.Value + 1) * (frameDelayCount.Value + 1) / ftq;
             }
+            receiveTime = TimeInterval.FromSeconds(frameDelay + seconds);
+            seconds += 2 * frameDelay;
 
             // In SSC mode PCR holds MSLSEN [0], CTQSEL1 [5:4], PCTQ1 [7:6],
             // DCTQ1 [12:8] and TIWEN [24]; its fields are named for ASC mode.
