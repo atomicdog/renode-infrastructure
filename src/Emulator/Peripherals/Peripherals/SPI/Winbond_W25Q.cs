@@ -6,11 +6,13 @@
 //
 using System;
 
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.SPI.NORFlash;
+using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 
 using Range = Antmicro.Renode.Core.Range;
@@ -26,7 +28,14 @@ namespace Antmicro.Renode.Peripherals.SPI
     //
     // The protection bits are non-volatile: they are kept across Reset(), so a lock set
     // by the firmware survives a system reset like it does on hardware.
-    public class Winbond_W25Q : GenericSpiFlash
+    //
+    // Program, erase and status-register writes can take time: the device is then busy
+    // (Status Register-1 WIP = 1) from chip-select deassert for the configured time and
+    // ignores every command except the status register reads, as the datasheet
+    // specifies. The times are 0 (instant) by default; the W25Q128JV's typical values
+    // are page program 400 us, 4 KB erase 45 ms, 32/64 KB erase 120/150 ms, chip erase
+    // 40 s and status register write 10 ms.
+    public class Winbond_W25Q : GenericSpiFlash, ISPIPeripheral
     {
         public Winbond_W25Q(MappedMemory underlyingMemory, byte memoryType = DefaultMemoryType)
             : base(underlyingMemory, manufacturerId: ManufacturerId, memoryType: memoryType,
@@ -69,6 +78,59 @@ namespace Antmicro.Renode.Peripherals.SPI
             base.Reset();
             statusRegister.Write(0, protectionBits);
             UpdateLockedRange();
+            busyUntil = TimeInterval.Empty;
+            ResetTransaction();
+        }
+
+        public ulong PageProgramMicroseconds { get; set; }
+
+        public ulong SectorEraseMicroseconds { get; set; }
+
+        public ulong BlockErase32Microseconds { get; set; }
+
+        public ulong BlockErase64Microseconds { get; set; }
+
+        public ulong ChipEraseMicroseconds { get; set; }
+
+        public ulong WriteStatusMicroseconds { get; set; }
+
+        public bool Busy => Now() < busyUntil;
+
+        // The SPI controller drives the device through ISPIPeripheral; these wrap the
+        // base implementation to time the operations and refuse commands while busy.
+        byte ISPIPeripheral.Transmit(byte data)
+        {
+            if(transactionBytes == 0)
+            {
+                transactionCommand = data;
+                ignoreTransaction = Busy && !IsStatusRead(data);
+                if(ignoreTransaction)
+                {
+                    this.Log(LogLevel.Warning, "Command 0x{0:X2} ignored: busy for {1} more", data, busyUntil - Now());
+                }
+                writeEnabledAtStart = WriteEnable;
+            }
+            else if(transactionBytes <= 3)
+            {
+                transactionAddress = (transactionAddress << 8) | data;
+            }
+            transactionBytes++;
+            return ignoreTransaction ? (byte)0xFF : Transmit(data);
+        }
+
+        void ISPIPeripheral.FinishTransmission()
+        {
+            if(!ignoreTransaction)
+            {
+                var busyTime = writeEnabledAtStart ? GetBusyTime() : 0;
+                if(busyTime > 0)
+                {
+                    busyUntil = Now() + TimeInterval.FromMicroseconds(busyTime);
+                    this.Log(LogLevel.Noisy, "Command 0x{0:X2}: busy for {1} us", transactionCommand, busyTime);
+                }
+                FinishTransmission();
+            }
+            ResetTransaction();
         }
 
         protected override void RecognizeOperation(byte firstByte)
@@ -107,6 +169,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             switch((uint)register)
             {
+            case (uint)Register.Status:
+                // WIP (bit 0)
+                return (byte)(base.ReadRegister(register) | (Busy ? 1 : 0));
             case (uint)InternalRegisters.Status2:
                 return statusRegister2.Read();
             case (uint)InternalRegisters.Status3:
@@ -164,6 +229,69 @@ namespace Antmicro.Renode.Peripherals.SPI
             // Programming can only clear bits; erased cells read 0xFF
             var currentVal = underlyingMemory.ReadByte(position);
             underlyingMemory.WriteByte(position, (byte)(val & currentVal));
+            programmedInTransaction = true;
+        }
+
+        private ulong GetBusyTime()
+        {
+            switch(transactionCommand)
+            {
+            case PageProgramCommand:
+                return programmedInTransaction ? PageProgramMicroseconds : 0;
+            case SectorEraseCommand:
+                return ErasesUnlocked(4.KB()) ? SectorEraseMicroseconds : 0;
+            case BlockErase32Command:
+                return ErasesUnlocked(32.KB()) ? BlockErase32Microseconds : 0;
+            case BlockErase64Command:
+                return ErasesUnlocked(64.KB()) ? BlockErase64Microseconds : 0;
+            case ChipEraseCommand:
+            case ChipEraseAlternativeCommand:
+                return lockedRange.HasValue ? 0 : ChipEraseMicroseconds;
+            case WriteStatusRegisterCommand:
+            case (byte)InternalCommands.WriteStatusRegister2:
+            case (byte)InternalCommands.WriteStatusRegister3:
+                return transactionBytes > 1 ? WriteStatusMicroseconds : 0;
+            default:
+                return 0;
+            }
+        }
+
+        // An erase runs when its address is complete and the block is not all protected
+        private bool ErasesUnlocked(int blockSize)
+        {
+            if(transactionBytes < 4)
+            {
+                return false;
+            }
+            var start = (ulong)blockSize * (transactionAddress / (ulong)blockSize);
+            var block = new Range(start, (ulong)blockSize);
+            return !lockedRange.HasValue || block.Subtract(lockedRange.Value).Count > 0;
+        }
+
+        private static bool IsStatusRead(byte command)
+        {
+            return command == ReadStatusRegisterCommand
+                || command == (byte)InternalCommands.ReadStatusRegister2
+                || command == (byte)InternalCommands.ReadStatusRegister3;
+        }
+
+        private TimeInterval Now()
+        {
+            var machine = this.GetMachine();
+            if(machine.SystemBus.TryGetCurrentCPU(out var cpu))
+            {
+                cpu.SyncTime();
+            }
+            return machine.ClockSource.CurrentValue;
+        }
+
+        private void ResetTransaction()
+        {
+            transactionBytes = 0;
+            transactionCommand = 0;
+            transactionAddress = 0;
+            ignoreTransaction = false;
+            programmedInTransaction = false;
         }
 
         private void UpdateLockedRange()
@@ -217,6 +345,13 @@ namespace Antmicro.Renode.Peripherals.SPI
         }
 
         private byte securityRegisterLocks;
+        private TimeInterval busyUntil;
+        private int transactionBytes;
+        private byte transactionCommand;
+        private ulong transactionAddress;
+        private bool ignoreTransaction;
+        private bool writeEnabledAtStart;
+        private bool programmedInTransaction;
 
         private readonly ByteRegister statusRegister2;
         private readonly ByteRegister statusRegister3;
@@ -231,6 +366,15 @@ namespace Antmicro.Renode.Peripherals.SPI
         private const byte DefaultStatusRegister3 = 0x60; // DRV = 25%
         // BP[2:0], TB, SEC, SRP
         private const byte StatusRegisterNonVolatileMask = 0xFC;
+
+        private const byte WriteStatusRegisterCommand = 0x01;
+        private const byte PageProgramCommand = 0x02;
+        private const byte ReadStatusRegisterCommand = 0x05;
+        private const byte SectorEraseCommand = 0x20;
+        private const byte BlockErase32Command = 0x52;
+        private const byte ChipEraseAlternativeCommand = 0x60;
+        private const byte ChipEraseCommand = 0xC7;
+        private const byte BlockErase64Command = 0xD8;
 
         private enum InternalCommands : byte
         {
