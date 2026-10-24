@@ -235,6 +235,13 @@ namespace Antmicro.Renode.Peripherals.CAN
         public CANNodeProxy Node1 { get; }
         public CANNodeProxy Node2 { get; }
 
+        // A node whose frames nothing receives (no hub or other listener on the
+        // node, or on the peripheral itself) has nobody to acknowledge them: each
+        // attempt ends in an ACK error and the frame is retried until something
+        // listens or the firmware cancels it, as on a bus with no other node.
+        // Set this to complete such frames anyway.
+        public bool AcknowledgeUnconnectedNodes { get; set; }
+
         /// <summary>
         /// Connect a specific CAN node to a CANHub.  Callable from the monitor:
         ///   can ConnectNodeToHub 1 dispCanHub
@@ -665,14 +672,90 @@ namespace Antmicro.Renode.Peripherals.CAN
                 CompleteTransmit(moIndex, frame);
                 return;
             }
+            var acknowledged = IsAcknowledged(txListNum - 1);
             var generation = transmitGeneration;
             this.GetMachine().ScheduleAction(Time.TimeInterval.FromTicks(frameEndTicks), _ =>
             {
-                if(generation == transmitGeneration)
+                if(generation != transmitGeneration)
+                {
+                    return;
+                }
+                if(acknowledged)
                 {
                     CompleteTransmit(moIndex, frame);
                 }
+                else
+                {
+                    FailTransmitWithoutAcknowledge(moIndex, txListNum - 1);
+                }
             });
+        }
+
+        private bool IsAcknowledged(int nodeIndex)
+        {
+            return AcknowledgeUnconnectedNodes
+                || (nodeRegisters[nodeIndex].Control & NcrLm) != 0
+                || nodeProxies[nodeIndex].HasListeners
+                || FrameSent != null;
+        }
+
+        // ACK error on a frame nobody received. The transmitter adds 8 to TEC,
+        // except when error passive (an error-passive transmitter's ACK error
+        // does not count), so a node alone on its bus stays error passive and
+        // never goes bus off. TXRQ stays set and the frame is sent again.
+        private void FailTransmitWithoutAcknowledge(int moIndex, int nodeIndex)
+        {
+            var node = nodeRegisters[nodeIndex];
+            var tec = (node.ErrorCount >> 8) & 0xFFu;
+            var leinc = 0u;
+            if(tec < ErrorPassiveLimit)
+            {
+                tec += 8;
+                leinc = NecntLeinc;
+            }
+            node.ErrorCount = (node.ErrorCount & ~(0xFFu << 8 | NecntLeinc)) | (tec << 8) | NecntLetd | leinc;
+            node.Status = (node.Status & ~0x7u) | LecAckError;
+            this.NoisyLog("MO{0}: no ACK on Node{1}, TEC {2}", moIndex, nodeIndex, tec);
+            if((node.Control & NcrLecie) != 0)
+            {
+                PulseNodeLine(nodeIndex, 4);
+            }
+            UpdateErrorWarning(nodeIndex);
+
+            if(!pendingTransmits[nodeIndex].Contains(moIndex))
+            {
+                pendingTransmits[nodeIndex].Enqueue(moIndex);
+            }
+            SchedulePendingTransmit(nodeIndex);
+        }
+
+        // NSR.EWRN follows the error counters against NECNT.EWRNLVL; a change
+        // sets NSR.ALERT and, with NCR.ALIE, pulses the alert line (ALINP).
+        private void UpdateErrorWarning(int nodeIndex)
+        {
+            var node = nodeRegisters[nodeIndex];
+            var level = (node.ErrorCount >> 16) & 0xFFu;
+            var warning = ((node.ErrorCount >> 8) & 0xFFu) >= level || (node.ErrorCount & 0xFFu) >= level;
+            if(warning == ((node.Status & NsrEwrn) != 0))
+            {
+                return;
+            }
+            node.Status = warning ? node.Status | NsrEwrn : node.Status & ~NsrEwrn;
+            node.Status |= NsrAlert;
+            if((node.Control & NcrAlie) != 0)
+            {
+                PulseNodeLine(nodeIndex, 0);
+            }
+        }
+
+        // NIPR holds ALINP [2:0], LECINP [6:4], TRINP [10:8] and CFCINP [14:12].
+        private void PulseNodeLine(int nodeIndex, int shift)
+        {
+            var line = (nodeRegisters[nodeIndex].InterruptPointer >> shift) & 0x7u;
+            if(line < NumberOfInterruptLines)
+            {
+                Connections[(int)line].Blink();
+            }
         }
 
         private void CompleteTransmit(int moIndex, CANMessageFrame frame)
@@ -690,6 +773,13 @@ namespace Antmicro.Renode.Peripherals.CAN
                 int nodeIndex = listNum - 1;
                 nodeRegisters[nodeIndex].Status |= NsrTxOk;
                 this.NoisyLog("Node{0}: NSR.TXOK set", nodeIndex);
+                // A successful transmit takes 1 off TEC
+                var tec = (nodeRegisters[nodeIndex].ErrorCount >> 8) & 0xFFu;
+                if(tec > 0)
+                {
+                    nodeRegisters[nodeIndex].ErrorCount = (nodeRegisters[nodeIndex].ErrorCount & ~(0xFFu << 8)) | ((tec - 1) << 8);
+                    UpdateErrorWarning(nodeIndex);
+                }
             }
 
             // Set MSPND bit: MSPND[TXINP] bit MPN
@@ -969,11 +1059,7 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
             if(nodeIndex >= 0 && nodeIndex < NumberOfNodes && (nodeRegisters[nodeIndex].Control & NcrTrie) != 0)
             {
-                var transferLine = nodeRegisters[nodeIndex].InterruptPointer & 0x7u;
-                if(transferLine < NumberOfInterruptLines)
-                {
-                    Connections[(int)transferLine].Blink();
-                }
+                PulseNodeLine(nodeIndex, 8);
             }
         }
 
@@ -1238,6 +1324,13 @@ namespace Antmicro.Renode.Peripherals.CAN
         private const uint NsrTxOk  = 1u << 3;
         private const uint NsrRxOk  = 1u << 4;
         private const uint NsrAlert = 1u << 5;
+        private const uint NsrEwrn  = 1u << 6;
+        private const uint LecAckError = 3;
+
+        // NECNT bit definitions
+        private const uint NecntLetd  = 1u << 24;
+        private const uint NecntLeinc = 1u << 25;
+        private const uint ErrorPassiveLimit = 128;
 
         /// <summary>
         /// Per-node register state for CAN nodes 0-2.
@@ -1259,7 +1352,8 @@ namespace Antmicro.Renode.Peripherals.CAN
                 InterruptPointer = 0;
                 PortControl = 0;
                 BitTiming = 0;
-                ErrorCount = 0;
+                // EWRNLVL = 96
+                ErrorCount = 0x00600000;
                 FrameCounter = 0;
             }
         }
@@ -1351,6 +1445,9 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 FrameSent?.Invoke(frame);
             }
+
+            // Something (a hub, a bridge) receives this node's frames
+            internal bool HasListeners => FrameSent != null;
 
             public event Action<CANMessageFrame> FrameSent;
 
