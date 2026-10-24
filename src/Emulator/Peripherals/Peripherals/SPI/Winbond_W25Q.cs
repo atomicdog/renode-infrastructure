@@ -32,8 +32,10 @@ namespace Antmicro.Renode.Peripherals.SPI
     // Program, erase and status-register writes can take time: the device is then busy
     // (Status Register-1 WIP = 1) from chip-select deassert for the configured time and
     // ignores every command except the status register reads, as the datasheet
-    // specifies. The times are 0 (instant) by default; the W25Q128JV's typical values
-    // are page program 400 us, 4 KB erase 45 ms, 32/64 KB erase 120/150 ms, chip erase
+    // specifies. A page program takes the first-byte time plus the next-byte time for
+    // each further byte it programs, up to the full page program time. The times are 0
+    // (instant) by default; the W25Q128JV's typical values are 30 us + 2.5 us per byte
+    // up to 400 us per page, 4 KB erase 45 ms, 32/64 KB erase 120/150 ms, chip erase
     // 40 s and status register write 10 ms.
     public class Winbond_W25Q : GenericSpiFlash, ISPIPeripheral
     {
@@ -83,6 +85,10 @@ namespace Antmicro.Renode.Peripherals.SPI
         }
 
         public ulong PageProgramMicroseconds { get; set; }
+
+        public double ByteProgramFirstMicroseconds { get; set; }
+
+        public double ByteProgramNextMicroseconds { get; set; }
 
         public ulong SectorEraseMicroseconds { get; set; }
 
@@ -229,7 +235,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             // Programming can only clear bits; erased cells read 0xFF
             var currentVal = underlyingMemory.ReadByte(position);
             underlyingMemory.WriteByte(position, (byte)(val & currentVal));
-            programmedInTransaction = true;
+            programmedInTransaction++;
         }
 
         private ulong GetBusyTime()
@@ -237,7 +243,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             switch(transactionCommand)
             {
             case PageProgramCommand:
-                return programmedInTransaction ? PageProgramMicroseconds : 0;
+                return GetProgramTime();
             case SectorEraseCommand:
                 return ErasesUnlocked(4.KB()) ? SectorEraseMicroseconds : 0;
             case BlockErase32Command:
@@ -254,6 +260,20 @@ namespace Antmicro.Renode.Peripherals.SPI
             default:
                 return 0;
             }
+        }
+
+        private ulong GetProgramTime()
+        {
+            if(programmedInTransaction == 0)
+            {
+                return 0;
+            }
+            if(ByteProgramFirstMicroseconds <= 0)
+            {
+                return PageProgramMicroseconds;
+            }
+            var time = (ulong)Math.Ceiling(ByteProgramFirstMicroseconds + (programmedInTransaction - 1) * ByteProgramNextMicroseconds);
+            return PageProgramMicroseconds > 0 ? Math.Min(time, PageProgramMicroseconds) : time;
         }
 
         // An erase runs when its address is complete and the block is not all protected
@@ -291,7 +311,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             transactionCommand = 0;
             transactionAddress = 0;
             ignoreTransaction = false;
-            programmedInTransaction = false;
+            programmedInTransaction = 0;
         }
 
         private void UpdateLockedRange()
@@ -351,7 +371,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private ulong transactionAddress;
         private bool ignoreTransaction;
         private bool writeEnabledAtStart;
-        private bool programmedInTransaction;
+        private int programmedInTransaction;    // bytes programmed
 
         private readonly ByteRegister statusRegister2;
         private readonly ByteRegister statusRegister3;
