@@ -49,6 +49,9 @@ namespace Antmicro.Renode.Peripherals.SPI
             commReg = new byte[numberOfDevices * 6];
             cmdBuffer = new byte[4];
             responseQueue = new Queue<byte>();
+            cellboxEeprom = new byte[numberOfDevices][];
+            i2cAddr = new int[numberOfDevices];
+            i2cAddrPending = new bool[numberOfDevices];
 
             Reset();
         }
@@ -66,6 +69,9 @@ namespace Antmicro.Renode.Peripherals.SPI
             Array.Clear(commReg, 0, commReg.Length);
             i2cReadMode = false;
             i2cRecordIndex = 0;
+            // cellboxEeprom (board wiring) is kept; the address pointers are not
+            Array.Clear(i2cAddr, 0, i2cAddr.Length);
+            Array.Clear(i2cAddrPending, 0, i2cAddrPending.Length);
 
             // Default cell voltages: 3.6V each (100µV/LSB → 36000)
             for(int i = 0; i < cellVoltages.Length; i++)
@@ -183,6 +189,38 @@ namespace Antmicro.Renode.Peripherals.SPI
         public void ClearCommI2CReadData()
         {
             commI2CReadData.Clear();
+        }
+
+        // Back an IC's COMM I2C slave with an addressed EEPROM (e.g. the cellbox
+        // ID EEPROM): the master writes a memory address, then reads from it.
+        // Unlike SetCommI2CReadByte (which serves a flat list from 0 on every
+        // read), this honours the address the firmware writes, so the same
+        // EEPROM serves both the 2-byte ID read and the full record read that
+        // address different offsets. Setting any byte puts that device in
+        // addressed mode. Default content is 0xFF (a blank/unprogrammed cell),
+        // and like the rest of the board wiring it is kept across a reset.
+        public void SetCellboxEepromByte(int device, int address, byte value)
+        {
+            if(device < 0 || device >= numberOfDevices)
+            {
+                this.Log(LogLevel.Warning, "Invalid device {0}, must be 0-{1}", device, numberOfDevices - 1);
+                return;
+            }
+            if(address < 0 || address > 0xFF)
+            {
+                this.Log(LogLevel.Warning, "Invalid cellbox EEPROM address 0x{0:X}, must be 0x00-0xFF", address);
+                return;
+            }
+            if(cellboxEeprom[device] == null)
+            {
+                var mem = new byte[256];
+                for(int i = 0; i < mem.Length; i++)
+                {
+                    mem[i] = 0xFF;
+                }
+                cellboxEeprom[device] = mem;
+            }
+            cellboxEeprom[device][address] = value;
         }
 
         // Monitor commands for configuring cell voltages.
@@ -488,22 +526,44 @@ namespace Antmicro.Renode.Peripherals.SPI
                         case 0x6: // START/repeated-START: D is the control byte (addr<<1|RW)
                             i2cReadMode = (data & 1) != 0;
                             i2cRecordIndex = 0;
+                            // On a write START the next data byte is the EEPROM
+                            // address; a read START keeps the address pointer.
+                            if(cellboxEeprom[dev] != null && !i2cReadMode)
+                            {
+                                i2cAddrPending[dev] = true;
+                            }
                             this.Log(LogLevel.Debug, "COMM I2C START dev{0} addr=0x{1:X2} {2}", dev, data >> 1, i2cReadMode ? "R" : "W");
-                            SetSlaveAcknowledge(hi);
+                            SetSlaveAcknowledge(hi, dev);
                             break;
                         case 0x0: // BLANK: a data byte
                             if(i2cReadMode)
                             {
                                 // Master clocks 0xFF and reads the slave's byte back
-                                var val = ReadCommI2CByte(i2cRecordIndex++);
-                                this.Log(LogLevel.Debug, "COMM I2C read[{0}] dev{1} -> 0x{2:X2}", i2cRecordIndex - 1, dev, val);
+                                byte val;
+                                if(cellboxEeprom[dev] != null)
+                                {
+                                    val = cellboxEeprom[dev][i2cAddr[dev] & 0xFF];
+                                    i2cAddr[dev] = (i2cAddr[dev] + 1) & 0xFF;
+                                }
+                                else
+                                {
+                                    val = ReadCommI2CByte(i2cRecordIndex++);
+                                }
+                                this.Log(LogLevel.Debug, "COMM I2C read dev{0} -> 0x{1:X2}", dev, val);
                                 commReg[hi] = (byte)((b0 & 0xF0) | (val >> 4));
                                 commReg[hi + 1] = (byte)(((val & 0xF) << 4) | (b1 & 0xF));
                             }
                             else
                             {
-                                // write byte (e.g. a memory address) — not stored
-                                SetSlaveAcknowledge(hi);
+                                // write byte: the EEPROM address pointer if one is
+                                // pending, otherwise written data (not stored)
+                                if(cellboxEeprom[dev] != null && i2cAddrPending[dev])
+                                {
+                                    i2cAddr[dev] = data;
+                                    i2cAddrPending[dev] = false;
+                                    this.Log(LogLevel.Debug, "COMM I2C addr dev{0} = 0x{1:X2}", dev, data);
+                                }
+                                SetSlaveAcknowledge(hi, dev);
                             }
                             break;
                         case 0x1: // STOP
@@ -515,9 +575,12 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
         }
 
-        private void SetSlaveAcknowledge(int slotIndex)
+        private void SetSlaveAcknowledge(int slotIndex, int device)
         {
-            var fcom = commI2CReadData.Count > 0 ? 0x7 : 0xF;
+            // The slave ACKs (FCOM 0111) when it is present: an addressed EEPROM
+            // on this IC, or flat read data configured.
+            var present = cellboxEeprom[device] != null || commI2CReadData.Count > 0;
+            var fcom = present ? 0x7 : 0xF;
             commReg[slotIndex + 1] = (byte)((commReg[slotIndex + 1] & 0xF0) | fcom);
         }
 
@@ -876,6 +939,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         private readonly byte[] cmdBuffer;
         private readonly Queue<byte> responseQueue;
         private readonly List<byte> commI2CReadData = new List<byte>();
+        private readonly byte[][] cellboxEeprom;
+        private readonly int[] i2cAddr;
+        private readonly bool[] i2cAddrPending;
 
         private byte[] writeBuffer;
         private int cmdByteIndex;
