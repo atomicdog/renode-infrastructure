@@ -43,6 +43,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             gpioRegisters = new ushort[numberOfDevices * NumberOfGpios];
             ref2Registers = new ushort[numberOfDevices];
             sumOfCells = new ushort[numberOfDevices];
+            outsideStack = new bool[numberOfDevices * NumberOfCells];
             configA = new byte[numberOfDevices * 6];
             configB = new byte[numberOfDevices * 6];
             commReg = new byte[numberOfDevices * 6];
@@ -236,6 +237,26 @@ namespace Antmicro.Renode.Peripherals.SPI
                     SetCellMillivolts(i, millivolts, d);
                 }
             }
+        }
+
+        // Board wiring, kept across a reset: SC measures the IC's own stack
+        // (V+ to V-), so an input wired outside it, e.g. an unused input tied
+        // off on a board with fewer cells, still converts but is not part of
+        // the sum of cells.
+        public void SetCellInStack(int cell, bool inStack, int device = 0)
+        {
+            if(device < 0 || device >= numberOfDevices)
+            {
+                this.Log(LogLevel.Warning, "Invalid device {0}, must be 0-{1}", device, numberOfDevices - 1);
+                return;
+            }
+            if(cell < 1 || cell > NumberOfCells)
+            {
+                this.Log(LogLevel.Warning, "Invalid cell number {0}, must be 1-{1}", cell, NumberOfCells);
+                return;
+            }
+            outsideStack[device * NumberOfCells + cell - 1] = !inStack;
+            UpdateSumOfCells();
         }
 
         public void SetGpioVoltage(int gpio, ushort rawValue, int device = 0)
@@ -772,7 +793,8 @@ namespace Antmicro.Renode.Peripherals.SPI
         }
 
         // SC (status register group A) is each IC's own sum of cells at
-        // 100µV * 30 per LSB (LTC6812/6813; the 12-cell LTC6811 uses * 20).
+        // 100µV * 30 per LSB (LTC6812/6813; the 12-cell LTC6811 uses * 20):
+        // the inputs in its stack (SetCellInStack).
         private void UpdateSumOfCells()
         {
             for(int dev = 0; dev < numberOfDevices; dev++)
@@ -780,6 +802,10 @@ namespace Antmicro.Renode.Peripherals.SPI
                 uint sum = 0;
                 for(int i = 0; i < NumberOfCells; i++)
                 {
+                    if(outsideStack[dev * NumberOfCells + i])
+                    {
+                        continue;
+                    }
                     sum += cellVoltages[dev * NumberOfCells + i];
                 }
                 sumOfCells[dev] = (ushort)(sum / 30);
@@ -862,6 +888,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private bool i2cReadMode;
         private int i2cRecordIndex;
         private readonly ushort[] sumOfCells;
+        private readonly bool[] outsideStack;
         private ushort internalTemp;
         private ushort analogSupply;
         private ushort digitalSupply;
