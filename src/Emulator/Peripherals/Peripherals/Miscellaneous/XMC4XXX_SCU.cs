@@ -339,25 +339,35 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // ────────────────────────────────────────────
         private void DefineHibernateRegisters(Dictionary<long, DoubleWordRegister> map)
         {
-            // HDSTAT @ 0x300 — Hibernate Domain Status
+            // HDSTAT @ 0x300 — Hibernate Domain Status: the wake-up events
+            // (EPEV/ENEV: WKUP pin edges, RTCEV, ULPWDG), set through HDSET and
+            // cleared through HDCLR. They live in the hibernate domain, so a
+            // system reset keeps them: firmware reads them after a wake to tell
+            // the wake source. A script can set one before start, e.g. RTCEV
+            // (HDSET = 0x4) for a wake by the RTC alarm.
             map.Add(0x300, new DoubleWordRegister(this)
-                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => hibDomainEnabled, name: "EPEV")
-                .WithTaggedFlag("ENEV", 1)
-                .WithTaggedFlag("RTCEV", 2)
-                .WithTaggedFlag("ULPWDG", 3)
+                .WithValueField(0, 4, FieldMode.Read, valueProviderCallback: _ => hibernateEvents, name: "EPEV_ENEV_RTCEV_ULPWDG")
                 .WithReservedBits(4, 28)
             );
 
             // HDCLR @ 0x304 — Hibernate Domain Status Clear (mirror register)
             map.Add(0x304, new DoubleWordRegister(this)
                 .WithValueField(0, 32, FieldMode.Write, name: "HDCLR",
-                    writeCallback: (_, __) => SignalMirrorWriteComplete(SrrawHdclr))
+                    writeCallback: (_, val) =>
+                    {
+                        hibernateEvents &= ~(val & HibernateEventsMask);
+                        SignalMirrorWriteComplete(SrrawHdclr);
+                    })
             );
 
             // HDSET @ 0x308 — Hibernate Domain Status Set (mirror register)
             map.Add(0x308, new DoubleWordRegister(this)
                 .WithValueField(0, 32, FieldMode.Write, name: "HDSET",
-                    writeCallback: (_, __) => SignalMirrorWriteComplete(SrrawHdset))
+                    writeCallback: (_, val) =>
+                    {
+                        hibernateEvents |= val & HibernateEventsMask;
+                        SignalMirrorWriteComplete(SrrawHdset);
+                    })
             );
 
             // HDCR @ 0x30C — Hibernate Domain Control (mirror register)
@@ -1091,6 +1101,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // Power / Hibernate domain
         private bool hibDomainEnabled;
+        // HDSTAT wake-up events; not cleared by a system reset
+        private ulong hibernateEvents;
+        private const ulong HibernateEventsMask = 0xF;
         private bool usbPhyActive;
 
         // SCU_INTERRUPT raw status (managed by set/clear + mirror write events)
